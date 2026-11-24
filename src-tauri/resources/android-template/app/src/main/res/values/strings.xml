@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">__APP_NAME__</string>
+    <string name="file_chooser_title">__FILE_CHOOSER_TITLE__</string>
+</resources>

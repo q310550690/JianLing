@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "茧灵",
+  "version": "0.1.0",
+  "identifier": "com.jianling.shell",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "茧灵 · 裹网于壳，藏灵于形",
+        "width": 1180,
+        "height": 840,
+        "minWidth": 940,
+        "minHeight": 620,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "theme": "Light",
+        "windowEffects": {
+          "effects": ["mica", "acrylic"],
+          "state": "active"
+        }
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "resources/android-template",
+      "resources/debug-inject",
+      "binaries/shell-host.exe"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

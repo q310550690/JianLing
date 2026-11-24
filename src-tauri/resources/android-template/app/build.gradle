@@ -1,0 +1,64 @@
+plugins {
+    id 'com.android.application'
+}
+
+// 签名信息通过环境变量注入，避免密码出现在命令行或构建文件里
+def ksPath = System.getenv("JIANLING_KS_PATH")
+def ksStorePass = System.getenv("JIANLING_KS_STORE_PASS")
+def ksAlias = System.getenv("JIANLING_KS_ALIAS")
+def ksKeyPass = System.getenv("JIANLING_KS_KEY_PASS")
+def hasSigning = ksPath != null && !ksPath.trim().isEmpty()
+
+android {
+    namespace '__APPLICATION_ID__'
+    compileSdk __COMPILE_SDK__
+
+    defaultConfig {
+        applicationId "__APPLICATION_ID__"
+        minSdk __MIN_SDK__
+        targetSdk __TARGET_SDK__
+        versionCode __VERSION_CODE__
+        versionName "__VERSION_NAME__"
+    }
+
+    if (hasSigning) {
+        signingConfigs {
+            release {
+                storeFile file(ksPath)
+                storePassword ksStorePass
+                keyAlias ksAlias
+                keyPassword ksKeyPass
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (hasSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+// AGP 8.1 的官方支持级别是 Java 8/11（改用 17 会要求 androidJdkImage，需要额外的 JDK 镜像），
+// 所以这里保持 Java 8，只把两条无用提示关掉：
+//   -options      → 「源值/目标值 8 已过时」三条
+//   -deprecation  → 兼容旧系统保留的过时 API（setSystemUiVisibility / 旧存储目录等）的 note
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += ["-Xlint:-options", "-Xlint:-deprecation"]
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.webkit:webkit:1.8.0'
+    implementation 'androidx.swiperefreshlayout:swiperefreshlayout:1.1.0'
+    implementation 'com.google.android.material:material:1.11.0'
+}

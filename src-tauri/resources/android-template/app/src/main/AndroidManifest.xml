@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+__PERMISSIONS__
+
+    <application
+        android:allowBackup="__ALLOW_BACKUP__"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="__USES_CLEARTEXT__"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.Jianling"
+        tools:targetApi="31">
+
+        <!-- 构建溯源水印：只有 aapt dump / 解包才能看到 -->
+        <meta-data
+            android:name="jianling.build.id"
+            android:value="__BUILD_ID__" />
+        <meta-data
+            android:name="jianling.build.version"
+            android:value="__BUILD_VERSION__" />
+        <meta-data
+            android:name="jianling.build.time"
+            android:value="__BUILD_TIME__" />
+        <meta-data
+            android:name="jianling.build.app"
+            android:value="__BUILD_APP__" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="__SCREEN_ORIENTATION__"
+            android:configChanges="orientation|screenSize|keyboardHidden|navigation|screenLayout|smallestScreenSize|uiMode"
+            android:hardwareAccelerated="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- FileProvider：用于拍照后分享图片文件给相机应用 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

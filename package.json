@@ -1,0 +1,29 @@
+{
+  "name": "jianling",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "sync-host": "cargo build --release --manifest-path shell-host/Cargo.toml && node -e \"require('fs').mkdirSync('src-tauri/binaries',{recursive:true});require('fs').copyFileSync('shell-host/target/release/shell-host.exe','src-tauri/binaries/shell-host.exe')\"",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.8.4",
+    "@tauri-apps/plugin-opener": "^2",
+    "element-plus": "^2.14.8",
+    "vue": "^3.5.13",
+    "vue-router": "^4.6.5"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16",
+    "vue-tsc": "^3.3.5"
+  }
+}

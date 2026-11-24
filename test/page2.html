@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>page2 · 导航测试</title>
+<style>
+  body { margin: 0; padding: 20px; font: 14px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #eef1f5; color: #1f2329; }
+  .card { background: #fff; border-radius: 10px; padding: 16px; margin-bottom: 12px; }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  button { padding: 8px 14px; font-size: 13px; border: 1px solid #d3d9e0; border-radius: 6px; background: #fff; margin: 0 8px 8px 0; }
+  code { background: #f2f4f7; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .big { font-size: 28px; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>第二页（导航 / 返回键测试）</h1>
+  <p>进入本页说明页内跳转正常。请测：<br>
+    1. 按<b>物理/手势返回</b> —— 应回到上一页，而不是直接退出应用（除非上一页就是入口且开启了「返回键退出」）。<br>
+    2. <b>导航栏</b>的左箭头 —— 应返回到上一页；右箭头/刷新正常。<br>
+    3. 从新窗口（target=_blank）打开本页时，观察是新建窗口还是复用当前窗口。</p>
+  <p>history.length = <code id="hl">-</code>，referrer = <code id="rf">-</code></p>
+</div>
+
+<div class="card">
+  <h1>页面状态</h1>
+  <div>计时：<span class="big" id="tick">0</span> 秒（切后台再回来，看是否停止计时/重启页面）</div>
+  <p>document.title = <code id="tt"></code></p>
+  <p><button onclick="history.back()">history.back()</button>
+     <button onclick="location.href='index.html'">回首页</button>
+     <button onclick="window.close()">window.close()</button>
+     <button onclick="location.href='page2.html'">再进一次本页（测前进栈）</button></p>
+</div>
+
+<div class="card">
+  <h1>滚动与长内容</h1>
+  <div id="long"></div>
+</div>
+
+<script>
+document.getElementById('hl').textContent = history.length;
+document.getElementById('rf').textContent = document.referrer || '(空)';
+document.getElementById('tt').textContent = document.title;
+var n = 0;
+setInterval(function () { document.getElementById('tick').textContent = ++n; }, 1000);
+
+var html = [];
+for (var i = 1; i <= 60; i++) html.push('<p>第 ' + i + ' 行：用于测试滚动条是否显示、滚动是否跟手、下拉刷新是否触发。</p>');
+document.getElementById('long').innerHTML = html.join('');
+</script>
+</body>
+</html>

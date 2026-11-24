@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Jianling 套壳自检</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 0 0 40px; font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f3d2e; color: #1f2329; }
+  header { position: sticky; top: 0; z-index: 10; padding: 12px 16px; background: #0f3d2e; border-bottom: 1px solid #1d5c46; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0 auto 0 0; color: #eaf5ef; }
+  .card { margin: 12px; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .card > h2 { margin: 0; padding: 10px 14px; font-size: 14px; background: #f7f9fc; border-bottom: 1px solid #eef1f5; }
+  .card > .hint { padding: 8px 14px 0; color: #6b7280; font-size: 12px; }
+  .row { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-top: 1px solid #f2f4f7; flex-wrap: wrap; }
+  .row:first-of-type { border-top: 0; }
+  .row .label { flex: 1 1 150px; min-width: 120px; }
+  .row .val { flex: 2 1 220px; min-width: 160px; color: #374151; word-break: break-all; font-size: 12px; }
+  button { padding: 6px 12px; font-size: 13px; border: 1px solid #d3d9e0; border-radius: 6px; background: #fff; color: #1f2329; cursor: pointer; }
+  button:active { background: #eef1f5; }
+  button.primary { background: #2E7D32; border-color: #2E7D32; color: #fff; }
+  .badge { display: inline-block; min-width: 16px; padding: 0 6px; border-radius: 10px; font-size: 11px; line-height: 18px; text-align: center; background: #e5e7eb; color: #374151; }
+  .badge.ok { background: #e6f4ea; color: #1e7b34; }
+  .badge.fail { background: #fdecec; color: #c0392b; }
+  .badge.wait { background: #fff4e5; color: #a15c00; }
+  pre { margin: 12px; padding: 12px; background: #0f172a; color: #d6e2f0; border-radius: 8px; font-size: 12px; white-space: pre-wrap; word-break: break-all; }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 2px 10px; padding: 4px 14px 10px; font-size: 12px; }
+  .kv b { font-weight: 500; color: #6b7280; }
+  .kv span { word-break: break-all; }
+  video, canvas { width: 100%; max-width: 320px; border-radius: 8px; background: #111; }
+  .spacer { height: 1px; }
+  small.note { display: block; padding: 0 14px 10px; color: #8a94a6; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Jianling 套壳自检</h1>
+  <button onclick="copyReport()">复制报告</button>
+  <button onclick="resetAll()">清空结果</button>
+</header>
+
+<section class="card">
+  <h2>1. 运行环境</h2>
+  <div class="kv" id="envBox"></div>
+  <small class="note">看 UA 是否带壳标记后缀、innerWidth/DPR 是否与真机一致、是否为 asset（appassets.androidplatform.net）还是远程地址。</small>
+</section>
+
+<section class="card">
+  <h2>2. 权限（重点：申请前是否有顶部用途说明）</h2>
+  <div class="hint">每点一次按钮，观察 ①状态栏下方是否出现说明区域（灰色悬浮卡片 + 阴影，标题就是配置里的「说明标题」原样显示，不会自动加应用名；无白色底、无「权限申请」大标题）②随后是否出现<b>系统</b>授权弹窗（带"仅本次允许"之类系统选项，没有自定义"允许/拒绝"按钮）。</div>
+  <div class="row"><span class="label">相机（getUserMedia video）</span><button onclick="askCam()">申请</button><span class="badge" id="b_cam">未测</span><span class="val" id="v_cam"></span></div>
+  <div class="row"><span class="label">麦克风（getUserMedia audio）</span><button onclick="askMic()">申请</button><span class="badge" id="b_mic">未测</span><span class="val" id="v_mic"></span></div>
+  <div class="row"><span class="label">相机 + 麦克风（一次请求两个权限）</span><button onclick="askCamMic()">申请</button><span class="badge" id="b_av">未测</span><span class="val" id="v_av"></span></div>
+  <div class="row"><span class="label">定位</span><button onclick="askGeo()">申请</button><span class="badge" id="b_geo">未测</span><span class="val" id="v_geo"></span></div>
+  <div class="row"><span class="label">通知</span><button onclick="askNotify()">申请</button><span class="badge" id="b_notify">未测</span><span class="val" id="v_notify"></span></div>
+  <div class="row"><span class="label">剪贴板 · 读</span><button onclick="readClip()">读取</button><span class="badge" id="b_clipr">未测</span><span class="val" id="v_clipr"></span></div>
+  <div class="row"><span class="label">剪贴板 · 写</span><button onclick="writeClip()">写入</button><span class="badge" id="b_clipw">未测</span><span class="val" id="v_clipw"></span></div>
+  <div class="row"><span class="label">摄像头预览</span><button onclick="startPreview()">启动</button><button onclick="stopPreview()">停止</button><span class="badge" id="b_prev">未测</span></div>
+  <video id="preview" playsinline muted autoplay style="display:none;margin:0 14px 10px"></video>
+  <small class="note">判定：先出现顶部说明 → 再出现系统框。若只在第二次点击才出现系统框、或完全没有顶部说明，记为 FAIL 并截图。</small>
+</section>
+
+<section class="card">
+  <h2>3. 媒体播放</h2>
+  <div class="row"><span class="label">自动播放（无手势）</span><button onclick="autoplayTestFromGesture()">再测一次</button><span class="badge" id="b_auto">未测</span><span class="val" id="v_auto"></span></div>
+  <div class="row"><span class="label">video 全屏按钮</span><button onclick="openFullscreenVideo()">打开</button><span class="badge" id="b_vfs">未测</span><span class="val" id="v_vfs"></span></div>
+  <div class="row"><span class="label">AudioContext</span><button onclick="audioCtxTest()">执行</button><span class="badge" id="b_actx">未测</span><span class="val" id="v_actx"></span></div>
+  <small class="note">打开全屏视频后按返回键，应能退出全屏而不是直接退出应用。</small>
+</section>
+
+<section class="card">
+  <h2>4. 存储</h2>
+  <div class="row"><span class="label">localStorage</span><button onclick="storageTest()">读写</button><span class="badge" id="b_ls">未测</span><span class="val" id="v_ls"></span></div>
+  <div class="row"><span class="label">sessionStorage</span><button onclick="sessionTest()">读写</button><span class="badge" id="b_ss">未测</span><span class="val" id="v_ss"></span></div>
+  <div class="row"><span class="label">Cookie</span><button onclick="cookieTest()">读写</button><span class="badge" id="b_ck">未测</span><span class="val" id="v_ck"></span></div>
+  <div class="row"><span class="label">IndexedDB</span><button onclick="idbTest()">读写</button><span class="badge" id="b_idb">未测</span><span class="val" id="v_idb"></span></div>
+  <small class="note">杀掉进程再进来，localStorage/Cookie/IndexedDB 应仍在；sessionStorage 应清空。</small>
+</section>
+
+<section class="card">
+  <h2>5. 网络</h2>
+  <div class="row"><span class="label">fetch 同源</span><button onclick="fetchSame()">请求</button><span class="badge" id="b_fs">未测</span><span class="val" id="v_fs"></span></div>
+  <div class="row"><span class="label">fetch 跨域</span><button onclick="fetchCross()">请求</button><span class="badge" id="b_fx">未测</span><span class="val" id="v_fx"></span></div>
+  <div class="row"><span class="label">WebSocket</span><button onclick="wsTest()">连接</button><span class="badge" id="b_ws">未测</span><span class="val" id="v_ws"></span></div>
+  <div class="row"><span class="label">在线状态</span><span class="val" id="v_online"></span></div>
+  <small class="note">同源请求指向本页目录下的 sample.txt；跨域默认请求 httpbin，内网可用请改成你自己的接口。WebSocket 默认连 echo 服务，失败不代表壳有问题。</small>
+</section>
+
+<section class="card">
+  <h2>6. 链接与下载</h2>
+  <div class="row"><span class="label">页内跳转 page2</span><button onclick="location.href='page2.html'">跳转</button><span class="badge" id="b_nav">未测</span></div>
+  <div class="row"><span class="label">新窗口打开（target=_blank）</span><button onclick="openBlank()">打开</button><span class="badge" id="b_blank">未测</span><span class="val" id="v_blank"></span></div>
+  <div class="row"><span class="label">外链（应走系统浏览器/新窗口）</span><button onclick="openExternal()">打开</button><span class="badge" id="b_ext">未测</span></div>
+  <div class="row"><span class="label">下载（a[download]）</span><button onclick="downloadFile()">下载</button><span class="badge" id="b_dl">未测</span><span class="val" id="v_dl"></span></div>
+  <div class="row"><span class="label">下载（blob）</span><button onclick="downloadBlob()">下载</button><span class="badge" id="b_dlb">未测</span></div>
+  <small class="note">下载后确认文件落在哪里：Android 应在系统下载目录/通知栏可见；Windows 应在浏览器默认下载目录或配置的子目录。</small>
+</section>
+
+<section class="card">
+  <h2>7. 文件与相机选择</h2>
+  <div class="row"><span class="label">选择文件</span><input type="file" onchange="filePicked(this)"><span class="badge" id="b_file">未测</span><span class="val" id="v_file"></span></div>
+  <div class="row"><span class="label">拍照（capture）</span><input type="file" accept="image/*" capture="environment" onchange="filePicked(this,'cam')"><span class="badge" id="b_capture">未测</span><span class="val" id="v_capture"></span></div>
+  <div class="row"><span class="label">多选</span><input type="file" multiple onchange="filePicked(this,'multi')"><span class="badge" id="b_multi">未测</span><span class="val" id="v_multi"></span></div>
+</section>
+
+<section class="card">
+  <h2>8. 交互与手势</h2>
+  <div class="row"><span class="label">文本选择</span><span class="val">长按下面的文字，能选中=允许</span></div>
+  <p style="padding:0 14px 10px;margin:0">这段文字用于测试长按选择与复制。如果长按没有任何选择手柄，说明长按被壳禁用了。</p>
+  <div class="row"><span class="label">双击缩放</span><span class="val">双击本段文字，页面放大=开启缩放</span></div>
+  <div class="row"><span class="label">滚动条可见性</span><span class="val" id="v_scroll"></span></div>
+  <div class="row"><span class="label">右键菜单（Windows）</span><span class="val" id="v_ctx"></span></div>
+  <div class="row"><span class="label">键盘 Ctrl+滚轮</span><span class="val" id="v_wheel"></span></div>
+  <div class="row"><span class="label">可视区域/安全区</span><span class="val" id="v_safe"></span></div>
+  <div class="row"><span class="label">状态栏高度变量</span><span class="val" id="v_sbh"></span></div>
+  <div class="row"><span class="label">变量自适应效果</span><span class="val"><span id="v_sbh_demo" style="display:block;background:#2E7D32;color:#fff;padding:8px 12px;border-radius:8px">padding-top: var(--status-bar-height)</span></span></div>
+  <div class="row"><span class="label">输入框（键盘/输入法）</span><input type="text" placeholder="点我输入中文" oninput="record('input', true, this.value.length + ' 字')"><span class="badge" id="b_input">未测</span></div>
+</section>
+
+<section class="card">
+  <h2>9. 导航与生命周期</h2>
+  <div class="row"><span class="label">历史记录</span><button onclick="history.back()">后退</button><span class="badge" id="b_back">未测</span></div>
+  <div class="row"><span class="label">弹窗</span><button onclick="alert('alert 正常');record('alert',true,'已弹出')">alert</button><button onclick="if(confirm('confirm 正常')){record('confirm',true,'已确认')}else{record('confirm',true,'已取消')}">confirm</button><button onclick="prompt('prompt 正常')">prompt</button><span class="badge" id="b_dlg">未测</span></div>
+  <div class="row"><span class="label">刷新当前页</span><button onclick="location.reload()">刷新</button></div>
+  <div class="row"><span class="label">页面可见性 / 前后台</span><span class="val" id="v_vis"></span></div>
+  <div class="row"><span class="label">JS 错误上报</span><span class="val" id="v_err"></span></div>
+</section>
+
+<section class="card">
+  <h2>10. 自检报告</h2>
+  <div class="hint">点「复制报告」把下面这段 JSON 复制出来发给我，比截图更快定位问题。</div>
+  <pre id="report">（尚无结果）</pre>
+</section>
+
+<script>
+var results = [];
+var startedAt = new Date().toISOString();
+
+function record(id, ok, text) {
+  var badge = document.getElementById('b_' + id);
+  if (badge) {
+    badge.className = 'badge ' + (ok === true ? 'ok' : ok === false ? 'fail' : 'wait');
+    badge.textContent = ok === true ? 'PASS' : ok === false ? 'FAIL' : '看说明';
+  }
+  var val = document.getElementById('v_' + id);
+  if (val) val.textContent = text || '';
+  results.push({ id: id, ok: ok, text: String(text == null ? '' : text), t: Date.now() });
+  render();
+}
+
+function render() {
+  var env = collectEnv();
+  document.getElementById('report').textContent = JSON.stringify({ startedAt: startedAt, env: env, results: results }, null, 2);
+}
+
+function collectEnv() {
+  var safe = '';
+  try {
+    var cs = getComputedStyle(document.documentElement);
+    safe = [cs.getPropertyValue('--sat'), cs.getPropertyValue('--sab')].join('/');
+  } catch (e) {}
+  return {
+    href: location.href,
+    origin: location.origin,
+    ua: navigator.userAgent,
+    dpr: window.devicePixelRatio,
+    inner: window.innerWidth + 'x' + window.innerHeight,
+    screen: screen.width + 'x' + screen.height,
+    lang: navigator.language,
+    platform: navigator.platform,
+    touch: 'ontouchstart' in window,
+    cookies: navigator.cookieEnabled,
+    uaData: navigator.userAgentData ? JSON.stringify(navigator.userAgentData.brands) : '(无)',
+    safeArea: safe,
+    historyLen: history.length
+  };
+}
+
+function envRow(k, v) {
+  return '<b>' + k + '</b><span>' + String(v == null ? '' : v).replace(/</g, '&lt;') + '</span>';
+}
+
+(function initEnv() {
+  var e = collectEnv();
+  document.getElementById('envBox').innerHTML = [
+    ['URL', e.href], ['UA', e.ua], ['DPR', e.dpr], ['窗口', e.inner], ['屏幕', e.screen],
+    ['语言', e.lang], ['平台', e.platform], ['触屏', e.touch], ['Cookie', e.cookies],
+    ['品牌', e.uaData], ['history', e.historyLen]
+  ].map(function (r) { return envRow(r[0], r[1]); }).join('');
+  document.getElementById('v_online').textContent = navigator.onLine ? 'online' : 'offline';
+  window.addEventListener('online', function () { document.getElementById('v_online').textContent = 'online'; });
+  window.addEventListener('offline', function () { document.getElementById('v_online').textContent = 'offline'; });
+  document.getElementById('v_ctx').textContent = '右键页面，若弹出系统菜单=仍可右键';
+  document.getElementById('v_wheel').textContent = '按住 Ctrl 滚轮，页面缩放=允许；无变化=禁止';
+  document.getElementById('v_scroll').textContent = '页面高度 ' + document.body.scrollHeight + 'px，是否出现滚动条按配置判定';
+  var safeEl = document.getElementById('v_safe');
+  var sbhEl = document.getElementById('v_sbh');
+  var sbhDemo = document.getElementById('v_sbh_demo');
+  function safeInfo() {
+    safeEl.textContent = 'inner=' + window.innerWidth + 'x' + window.innerHeight
+      + ' vv=' + (window.visualViewport ? Math.round(window.visualViewport.height) : '-');
+    var sbh = getComputedStyle(document.documentElement).getPropertyValue('--status-bar-height').trim();
+    sbhEl.textContent = sbh ? sbh + '（0 或空 = 壳未注入 / 非边到边）' : '未注入（0）';
+    sbhDemo.style.paddingTop = 'calc(8px + ' + (sbh || '0px') + ')';
+  }
+  safeInfo();
+  window.addEventListener('resize', safeInfo);
+  document.getElementById('v_vis').textContent = 'visibility=' + document.visibilityState;
+  document.addEventListener('visibilitychange', function () {
+    document.getElementById('v_vis').textContent = 'visibility=' + document.visibilityState;
+    record('vis', true, document.visibilityState);
+  });
+  window.addEventListener('error', function (ev) {
+    document.getElementById('v_err').textContent = (ev.message || '') + ' @' + (ev.filename || '').split('/').pop();
+    record('jserr', false, ev.message || '');
+  });
+  window.addEventListener('unhandledrejection', function (ev) {
+    document.getElementById('v_err').textContent = 'promise: ' + ev.reason;
+    record('jserr', false, 'promise: ' + ev.reason);
+  });
+  render();
+
+  // 页面加载后立刻尝试播放（没有用户手势），用来验证「媒体手势要求 / autoplay」配置
+  setTimeout(function () {
+    var a = document.createElement('audio');
+    a.src = silentWavUrl(0.4);
+    a.volume = 0.02;
+    var p = a.play();
+    if (!p || !p.then) { record('auto', false, 'play() 无 Promise'); return; }
+    p.then(function () {
+      record('auto', true, '无手势自动播放成功（配置未强制手势）');
+      setTimeout(function () { try { a.pause(); } catch (e) {} }, 500);
+    }).catch(function (e) {
+      record('auto', false, '无手势被拦：' + mediaError(e) + '（若配置为允许自动播放，则为 FAIL）');
+    });
+  }, 400);
+})();
+
+/* ---------- 权限 ---------- */
+function mediaError(e) {
+  return (e && (e.name || e.message)) ? (e.name + ': ' + e.message) : String(e);
+}
+
+function askCam() {
+  record('cam', null, '请求中…');
+  navigator.mediaDevices.getUserMedia({ video: true })
+    .then(function (s) { record('cam', true, '已授权，轨道 ' + s.getTracks().length + '，标签 ' + s.getVideoTracks()[0].label); s.getTracks().forEach(function (t) { t.stop(); }); })
+    .catch(function (e) { record('cam', false, mediaError(e)); });
+}
+
+function askMic() {
+  record('mic', null, '请求中…');
+  navigator.mediaDevices.getUserMedia({ audio: true })
+    .then(function (s) { record('mic', true, '已授权，轨道 ' + s.getTracks().length); s.getTracks().forEach(function (t) { t.stop(); }); })
+    .catch(function (e) { record('mic', false, mediaError(e)); });
+}
+
+function askCamMic() {
+  // 一次 getUserMedia 同时要音频+视频：内核只发一个 PermissionRequest，但里面带 2 个资源，
+  // 顶部说明卡片应该同时列出「相机」「麦克风」两条
+  record('av', null, '一次请求中…（顶部说明应同时出现两条）');
+  navigator.mediaDevices.getUserMedia({ audio: true, video: true })
+    .then(function (s) { record('av', true, '已授权，轨道 ' + s.getTracks().length); s.getTracks().forEach(function (t) { t.stop(); }); })
+    .catch(function (e) { record('av', false, mediaError(e)); });
+}
+
+function startPreview() {
+  var v = document.getElementById('preview');
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } })
+    .then(function (s) { v.srcObject = s; v.style.display = 'block'; v.play(); record('prev', true, '预览中'); })
+    .catch(function (e) { record('prev', false, mediaError(e)); });
+}
+
+function stopPreview() {
+  var v = document.getElementById('preview');
+  if (v.srcObject) { v.srcObject.getTracks().forEach(function (t) { t.stop(); }); v.srcObject = null; }
+  v.style.display = 'none';
+  record('prev', true, '已停止');
+}
+
+function askGeo() {
+  if (!navigator.geolocation) { record('geo', false, '不支持 geolocation'); return; }
+  record('geo', null, '请求中…');
+  navigator.geolocation.getCurrentPosition(
+    function (p) { record('geo', true, p.coords.latitude.toFixed(5) + ',' + p.coords.longitude.toFixed(5) + ' ±' + Math.round(p.coords.accuracy) + 'm'); },
+    function (e) { record('geo', false, e.code + ' ' + e.message); },
+    { timeout: 60000, enableHighAccuracy: false }
+  );
+}
+
+function askNotify() {
+  // WebView 不支持 Notification API，通知权限只能走壳桥：先出顶部说明，再弹系统授权框
+  if (!window.Jianling || !window.Jianling.requestPermission) {
+    record('notify', false, '当前壳没有 Jianling.requestPermission');
+    return;
+  }
+  var r = window.Jianling.requestPermission('notification');
+  if (r === 'requested') { record('notify', null, '已请求：看顶部说明卡片 + 系统框'); return; }
+  if (r === 'granted') { record('notify', true, '无需申请：系统已授予，或该 Android 版本没有通知运行时权限'); return; }
+  record('notify', false, '壳桥不支持：' + r);
+}
+
+function readClip() {
+  if (!navigator.clipboard || !navigator.clipboard.readText) { record('clipr', false, '不支持 clipboard.readText'); return; }
+  navigator.clipboard.readText().then(function (t) { record('clipr', true, '读到 ' + t.length + ' 字：' + t.slice(0, 40)); })
+    .catch(function (e) { record('clipr', false, mediaError(e)); });
+}
+
+function writeClip() {
+  if (!navigator.clipboard || !navigator.clipboard.writeText) { record('clipw', false, '不支持 clipboard.writeText'); return; }
+  navigator.clipboard.writeText('jianling-clip-' + Date.now()).then(function () { record('clipw', true, '已写入，可粘贴到别处验证'); })
+    .catch(function (e) { record('clipw', false, mediaError(e)); });
+}
+
+/* ---------- 媒体 ---------- */
+/* 生成一段静音 WAV，避免依赖外网音频文件 */
+function silentWavUrl(sec) {
+  var rate = 8000, n = Math.floor(rate * (sec || 0.4));
+  var buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  function w(off, s) { for (var i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); }
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, n * 2, true);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+function autoplayTestFromGesture() {
+  var a = document.createElement('audio');
+  a.src = silentWavUrl(0.4);
+  var p = a.play();
+  if (!p || !p.then) { record('auto', false, 'play() 无 Promise'); return; }
+  p.then(function () { record('auto', true, '手势内播放成功（说明内核放行了音频）'); })
+   .catch(function (e) { record('auto', false, mediaError(e)); });
+}
+
+function openFullscreenVideo() {
+  // 用 canvas 造一条真实视频流：只有音轨的话画面全黑，看不出「全屏有没有铺开」
+  var c = document.createElement('canvas');
+  c.width = 640; c.height = 360;
+  var ctx = c.getContext('2d');
+  var tick = 0;
+  var timer = setInterval(function () {
+    tick++;
+    ctx.fillStyle = '#0a3d2e'; ctx.fillRect(0, 0, 640, 360);
+    ctx.fillStyle = '#ffcc00'; ctx.fillRect((tick * 24) % 600, 140, 40, 40);
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(40, 40, 200, 24);
+  }, 50);
+
+  var v = document.createElement('video');
+  v.muted = true; v.playsInline = false; v.controls = true;
+  // max-width:none 必须显式写：页面顶部有 `video { max-width: 320px }`，否则全屏层只剩一条窄条
+  v.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;max-width:none;background:#000;z-index:99';
+  if (c.captureStream) v.srcObject = c.captureStream(20);
+  document.body.appendChild(v);
+
+  var closeBtn = document.createElement('button');
+  closeBtn.textContent = '关闭';
+  closeBtn.style.cssText = 'position:fixed;right:12px;top:12px;z-index:100';
+  document.body.appendChild(closeBtn);
+
+  var closed = false;
+  var watch = null;
+  function close(reason) {
+    if (closed) return;
+    closed = true;
+    clearInterval(timer);
+    if (watch) clearInterval(watch);
+    try { v.pause(); v.srcObject = null; } catch (e) { }
+    if (v.parentNode) v.parentNode.removeChild(v);
+    if (closeBtn.parentNode) closeBtn.parentNode.removeChild(closeBtn);
+    record('vfs', true, reason);
+  }
+  closeBtn.onclick = function () { close('已关闭全屏视频，播放已停止'); };
+  v.addEventListener('webkitendfullscreen', function () {
+    close('已退出全屏，页面还在（返回键没有把页面一起退掉）');
+  });
+
+  v.play().then(function () {
+    if (v.webkitEnterFullscreen) {
+      v.webkitEnterFullscreen();
+      record('vfs', null, '已进入系统全屏：按返回键应只退出全屏并停止播放');
+      // 这个 WebView 不一定触发 webkitendfullscreen，用 webkitDisplayingFullscreen 轮询兜底
+      setTimeout(function () {
+        watch = setInterval(function () {
+          if (!closed && v.webkitDisplayingFullscreen === false) {
+            close('已退出全屏（返回键），播放已停止，页面还在');
+          }
+        }, 300);
+      }, 800);
+    } else if (v.requestFullscreen) {
+      v.requestFullscreen();
+      record('vfs', null, '已进入全屏：按返回键应只退出全屏并停止播放');
+    } else {
+      record('vfs', false, '内核不支持全屏 API');
+    }
+  }).catch(function (e) { record('vfs', false, mediaError(e)); });
+}
+
+function audioCtxTest() {
+  try {
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    record('actx', ctx.state === 'running', 'state=' + ctx.state);
+    ctx.close && ctx.close();
+  } catch (e) { record('actx', false, mediaError(e)); }
+}
+
+/* ---------- 存储 ---------- */
+function storageTest() {
+  try {
+    var k = 'jianling_test_ls', v = String(Date.now());
+    localStorage.setItem(k, v);
+    record('ls', localStorage.getItem(k) === v, '写入并读回 ' + v);
+  } catch (e) { record('ls', false, mediaError(e)); }
+}
+
+function sessionTest() {
+  try {
+    var k = 'jianling_test_ss', v = String(Date.now());
+    sessionStorage.setItem(k, v);
+    record('ss', sessionStorage.getItem(k) === v, '写入并读回 ' + v);
+  } catch (e) { record('ss', false, mediaError(e)); }
+}
+
+function cookieTest() {
+  try {
+    document.cookie = 'jianling_test=1; path=/; max-age=3600';
+    record('ck', document.cookie.indexOf('jianling_test=1') >= 0, document.cookie || '(空)');
+  } catch (e) { record('ck', false, mediaError(e)); }
+}
+
+function idbTest() {
+  if (!window.indexedDB) { record('idb', false, '不支持 IndexedDB'); return; }
+  var req;
+  try { req = indexedDB.open('jianling_test_db', 1); } catch (e) { record('idb', false, mediaError(e)); return; }
+  req.onupgradeneeded = function () { req.result.createObjectStore('kv'); };
+  req.onsuccess = function () {
+    try {
+      var db = req.result, tx = db.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put(Date.now(), 'k');
+      tx.oncomplete = function () { record('idb', true, '写入成功'); db.close(); };
+      tx.onerror = function () { record('idb', false, '事务失败'); };
+    } catch (e) { record('idb', false, mediaError(e)); }
+  };
+  req.onerror = function () { record('idb', false, '打开失败'); };
+}
+
+/* ---------- 网络 ---------- */
+function fetchSame() {
+  record('fs', null, '请求中…');
+  fetch('sample.txt?t=' + Date.now()).then(function (r) {
+    return r.text().then(function (t) { record('fs', r.ok, 'status=' + r.status + ' 内容=' + t.trim().slice(0, 40)); });
+  }).catch(function (e) { record('fs', false, mediaError(e)); });
+}
+
+function fetchCross() {
+  var url = 'https://httpbin.org/get?t=' + Date.now();
+  record('fx', null, '请求中…（跨域）');
+  fetch(url).then(function (r) { record('fx', r.ok, 'status=' + r.status); })
+    .catch(function (e) { record('fx', false, mediaError(e)); });
+}
+
+var ws = null;
+function wsTest() {
+  try { if (ws) { ws.close(); ws = null; } } catch (e) {}
+  record('ws', null, '连接中…');
+  var url = 'wss://echo.websocket.events/';
+  try { ws = new WebSocket(url); } catch (e) { record('ws', false, mediaError(e)); return; }
+  var timer = setTimeout(function () { record('ws', false, '5s 未连上'); }, 5000);
+  ws.onopen = function () { clearTimeout(timer); record('ws', true, '已连接 ' + url); try { ws.send('ping'); } catch (e) {} };
+  ws.onerror = function () { clearTimeout(timer); record('ws', false, '连接失败'); };
+  ws.onmessage = function (ev) { record('ws', true, '收到回包 ' + String(ev.data).slice(0, 20)); };
+}
+
+/* ---------- 链接与下载 ---------- */
+function openBlank() {
+  var w = window.open('page2.html', '_blank');
+  record('blank', w != null, w ? '新窗口已返回' : 'window.open 返回 null（被拦截或复用当前窗口）');
+}
+
+function openExternal() {
+  window.open('https://www.baidu.com', '_blank');
+  record('ext', true, '已尝试打开外链，看是内置窗口、系统浏览器还是无反应');
+}
+
+function downloadFile() {
+  var a = document.createElement('a');
+  a.href = 'sample.txt';
+  a.download = 'jianling-download-' + Date.now() + '.txt';
+  document.body.appendChild(a); a.click(); a.remove();
+  record('dl', null, '已触发，去下载目录/通知栏确认');
+}
+
+function downloadBlob() {
+  var blob = new Blob(['jianling blob download ' + new Date().toISOString()], { type: 'text/plain' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'jianling-blob-' + Date.now() + '.txt';
+  document.body.appendChild(a); a.click(); a.remove();
+  record('dlb', null, '已触发 blob 下载');
+}
+
+/* ---------- 文件 ---------- */
+function filePicked(input, tag) {
+  var id = tag || 'file';
+  if (!input.files || !input.files.length) { record(id, false, '未选到文件'); return; }
+  var f = input.files[0];
+  record(id, true, input.files.length + ' 个文件，首个 ' + f.name + ' ' + Math.round(f.size / 1024) + 'KB ' + (f.type || '未知类型'));
+}
+
+/* ---------- 报告 ---------- */
+function copyReport() {
+  var text = document.getElementById('report').textContent;
+  var done = function () { alert('报告已复制'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, function () { legacyCopy(text); done(); });
+  } else { legacyCopy(text); done(); }
+}
+
+function legacyCopy(text) {
+  var ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  ta.remove();
+}
+
+function resetAll() {
+  results = [];
+  document.querySelectorAll('.badge').forEach(function (b) { b.className = 'badge'; b.textContent = '未测'; });
+  document.querySelectorAll('.val').forEach(function (v) { if (!v.dataset.keep) v.textContent = ''; });
+  render();
+}
+
+render();
+</script>
+</body>
+</html>

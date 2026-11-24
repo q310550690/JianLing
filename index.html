@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>茧灵 · 裹网于壳，藏灵于形</title>
+    <!-- 启动图：内联样式，保证 JS 包加载前就能画出来；Vue 挂载后由 main.ts 淡出移除 -->
+    <style>
+      #boot-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: #ffffff;
+        transition: opacity 0.26s ease;
+      }
+      #boot-splash img {
+        width: 104px;
+        height: 104px;
+        object-fit: contain;
+        animation: boot-splash-breathe 1.6s ease-in-out infinite;
+      }
+      #boot-splash .boot-title {
+        font-family: "Segoe UI Variable Text", "Microsoft YaHei UI", sans-serif;
+        font-size: 20px;
+        font-weight: 600;
+        letter-spacing: 0.14em;
+        color: #0f172a;
+      }
+      #boot-splash .boot-slogan {
+        font-family: "Segoe UI Variable Text", "Microsoft YaHei UI", sans-serif;
+        font-size: 12px;
+        letter-spacing: 0.24em;
+        color: #6b7688;
+      }
+      @keyframes boot-splash-breathe {
+        0%,
+        100% {
+          transform: scale(1);
+          opacity: 1;
+        }
+        50% {
+          transform: scale(0.94);
+          opacity: 0.86;
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <div id="boot-splash">
+      <img src="/brand-logo.png" alt="茧灵" />
+      <div class="boot-title">茧灵</div>
+      <div class="boot-slogan">裹网于壳，藏灵于形</div>
+    </div>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

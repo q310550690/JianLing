@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 与位图夜空一致的深蓝底色，避免掩码边缘露出纯白 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="__ICON_BACKGROUND__" />
+</shape>
