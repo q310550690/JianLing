@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { Files, Setting, Link } from "@element-plus/icons-vue";
+import { Files, Setting, Link, Refresh } from "@element-plus/icons-vue";
+import { ElMessage } from "element-plus";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { APP_INFO } from "../app-info";
+import { checkUpdate, notifyUpdate } from "../update";
 
 const route = useRoute();
 const router = useRouter();
@@ -27,6 +29,32 @@ async function openHomepage() {
     await openUrl(APP_INFO.homepage);
   } catch {
     // 外部打不开就静默失败，不影响界面
+  }
+}
+
+const checking = ref(false);
+
+/** 手动检查更新：有新版本弹通知，否则提示已是最新 */
+async function checkUpdateNow() {
+  if (checking.value)
+    return;
+  checking.value = true;
+  try {
+    const info = await checkUpdate(APP_INFO.version, true);
+    if (info)
+      notifyUpdate(info);
+    else
+      ElMessage.success(`已是最新版本 v${APP_INFO.version}`);
+  }
+  catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === "暂无可用版本")
+      ElMessage.warning("仓库尚未发布版本");
+    else
+      ElMessage.error(`检查更新失败：${message}`);
+  }
+  finally {
+    checking.value = false;
   }
 }
 </script>
@@ -61,12 +89,23 @@ async function openHomepage() {
 
       <div class="app-info">
         <div class="info-name">{{ APP_INFO.name }}</div>
-        <div class="info-line">{{ APP_INFO.summary }} · v{{ APP_INFO.version }}</div>
-        <div class="info-line">{{ APP_INFO.stack }}</div>
-        <button class="info-link" type="button" @click="openHomepage">
-          <el-icon :size="12"><Link /></el-icon>
-          <span>{{ APP_INFO.homepage }}</span>
-        </button>
+        <div class="info-line">{{ APP_INFO.summary }}</div>
+        <div class="info-actions">
+          <button class="info-link" type="button" @click="openHomepage">
+            <el-icon :size="12"><Link /></el-icon>
+            <span>查看项目</span>
+          </button>
+          <button
+            class="info-link"
+            type="button"
+            title="检查更新"
+            :disabled="checking"
+            @click="checkUpdateNow"
+          >
+            <el-icon :size="12"><Refresh /></el-icon>
+            <span>v{{ APP_INFO.version }}</span>
+          </button>
+        </div>
       </div>
     </aside>
 
@@ -197,11 +236,17 @@ async function openHomepage() {
   word-break: break-all;
 }
 
+.info-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
 .info-link {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  margin-top: 8px;
   padding: 0;
   border: none;
   background: transparent;
@@ -217,6 +262,11 @@ async function openHomepage() {
   color: var(--accent);
   text-decoration: underline;
   text-underline-offset: 3px;
+}
+
+.info-link:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 .main {

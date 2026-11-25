@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, provide, watch } from "vue";
+import { computed, nextTick, onMounted, provide, watch } from "vue";
 import { useRoute } from "vue-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, FullScreen, Close } from "@element-plus/icons-vue";
+import { APP_INFO } from "./app-info";
+import { checkUpdate, notifyUpdate } from "./update";
 
 const route = useRoute();
 const appWindow = getCurrentWindow();
@@ -42,6 +44,18 @@ function toggleMaximize() {
 function closeWindow() {
   appWindow.close();
 }
+
+// 启动后检测新版本：有更新时弹出提示，点击打开下载页面
+onMounted(async () => {
+  try {
+    const info = await checkUpdate(APP_INFO.version);
+    if (info)
+      notifyUpdate(info);
+  }
+  catch {
+    // 启动检测失败不打扰用户
+  }
+});
 </script>
 
 <template>
