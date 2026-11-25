@@ -34,7 +34,7 @@ pub struct Tray {
 pub fn install(tip: &str, target_hwnd: isize) -> Option<Tray> {
     TARGET.store(target_hwnd, std::sync::atomic::Ordering::SeqCst);
 
-    let class = to_wide("JianlingTrayWindow");
+    let class = to_wide("JianLingTrayWindow");
     let wnd_class = WNDCLASSW {
         lpfnWndProc: Some(wnd_proc),
         lpszClassName: PCWSTR(class.as_ptr()),

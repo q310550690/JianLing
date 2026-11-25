@@ -2,7 +2,7 @@
 name = "shell-host"
 version = "0.1.0"
 edition = "2021"
-description = "Jianling generated Windows web app host"
+description = "JianLing generated Windows web app host"
 
 [dependencies]
 tao = "0.34"

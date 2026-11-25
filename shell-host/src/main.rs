@@ -1,4 +1,4 @@
-//! Jianling 生成的 Windows 桌面套壳宿主。
+//! JianLing 生成的 Windows 桌面套壳宿主。
 //!
 //! 运行时读取同目录下的 `shell.json`（缺省字段都有默认值）：
 //! ```json
@@ -96,6 +96,9 @@ impl Default for SplashCfg {
 struct ShellConfig {
     title: String,
     url: String,
+    /// 附加到启动地址的查询参数（可选），如 key=value
+    #[serde(default)]
+    start_query: String,
     #[serde(default)]
     local_index: Option<String>,
     #[serde(default = "default_width")]
@@ -232,8 +235,9 @@ fn default_aspect_h() -> f64 {
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
-            title: "Jianling".into(),
+            title: "JianLing".into(),
             url: "about:blank".into(),
+            start_query: String::new(),
             local_index: None,
             width: default_width(),
             height: default_height(),
@@ -443,10 +447,42 @@ fn nav_bar_height(config: &ShellConfig) -> u32 {
     }
 }
 
+/// 壳标识：与 Android 的 window.JianLing 对齐，页面脚本执行前就已存在，供前端判定「是否在壳内」。
+/// Android 侧是真实原生桥（方法回调 Java）；桌面端没有对应能力，只提供同名对象与只读信息。
+fn jianling_bridge_script() -> String {
+    let version =
+        serde_json::to_string(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| "\"\"".to_string());
+    let info = serde_json::json!({
+        "platform": "windows",
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "shellVersion": env!("CARGO_PKG_VERSION"),
+    })
+    .to_string();
+    let info = serde_json::to_string(&info).unwrap_or_else(|_| "\"{}\"".to_string());
+    // 只保留与 Android 完全一致的方法面，避免前端依赖桌面端独有的字段。
+    format!(
+        "(function(){{if(window.JianLing){{return;}}\
+window.JianLing={{\
+getVersion:function(){{return {version};}},\
+getDeviceInfo:function(){{return {info};}}}};}})();\n"
+    )
+}
+
+/// 把配置的查询参数拼到启动地址后：自动补 `?` 或 `&`，空值原样返回。
+fn append_query(url: &str, query: &str) -> String {
+    let query = query.trim().trim_start_matches(|c: char| c == '?' || c == '&');
+    if query.is_empty() {
+        return url.to_string();
+    }
+    format!("{url}{}{query}", if url.contains('?') { '&' } else { '?' })
+}
+
 /// 把浏览器行为开关翻译成一段在页面创建时立即执行的脚本。
 fn build_init_script(config: &ShellConfig) -> Option<String> {
     // 立即执行的监听：document / window 在文档创建阶段已经存在。
-    let mut immediate = String::new();
+    // 壳标识放在最前面且不受功能开关影响，保证任何配置下都能探测到。
+    let mut immediate = jianling_bridge_script();
     if config.external_links_in_browser {
         immediate.push_str(EXTERNAL_LINKS_SCRIPT);
     }
@@ -666,7 +702,7 @@ fn wide(text: &str) -> Vec<u16> {
 /// 单实例：同名互斥体已存在时把已有窗口拉到前台，并让本次启动退出。
 #[cfg(windows)]
 fn claim_single_instance(title: &str) -> bool {
-    let name = wide(&format!("JianlingShellHost_{title}"));
+    let name = wide(&format!("JianLingShellHost_{title}"));
     unsafe {
         let handle = win32::CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
         if handle.is_null() {
@@ -706,7 +742,7 @@ fn sync_autostart(enable: bool, app_name: &str) {
         .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
         .collect();
     let value_name = if cleaned.trim().is_empty() {
-        "Jianling".to_string()
+        "JianLing".to_string()
     } else {
         cleaned.trim().to_string()
     };
@@ -1246,6 +1282,7 @@ fn main() {
         }
         None => config.url.clone(),
     };
+    let target = append_query(&target, &config.start_query);
 
     let splash_html = if config.splash.enabled {
         Some(build_splash_html(&config))

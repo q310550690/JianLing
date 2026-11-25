@@ -1,6 +1,6 @@
-# Jianling 套壳测试项目（test/）
+# JianLing 套壳测试项目（test/）
 
-这个目录是一个**可以直接被 Jianling 打包的 H5 内容目录**，用来一次性地测三端（Android / Windows / 静态站点）的壳能力。
+这个目录是一个**可以直接被 JianLing 打包的 H5 内容目录**，用来一次性地测三端（Android / Windows / 静态站点）的壳能力。
 以后要回归测试，不用再写临时页面，直接复用这里。
 
 ```
@@ -17,7 +17,7 @@ test/
 
 ## 一、怎么用它打包
 
-Jianling（本项目）里新建/编辑项目，按下表填：
+JianLing（本项目）里新建/编辑项目，按下表填：
 
 | 配置项 | 建议值 | 说明 |
 | --- | --- | --- |
@@ -82,7 +82,7 @@ adb shell "dumpsys package com.aspire.shelltest | grep -E 'CAMERA:|RECORD_AUDIO:
    随后系统会连着弹两个授权框（相机、麦克风各一个），全部允许后该行记 PASS，值里显示 `轨道 2`。
 
 「通知」不再走 WebView 的 `Notification.requestPermission()`（内核不支持，必然 FAIL），
-改为调壳桥 `window.Jianling.requestPermission('notification')`：
+改为调壳桥 `window.JianLing.requestPermission('notification')`：
 Android 13+ 会先出说明卡片再弹系统框；13 以下没有通知运行时权限，页面直接记 PASS。
 
 记录证据的两种方式：

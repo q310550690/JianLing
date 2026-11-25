@@ -66,6 +66,8 @@ pub struct AndroidProfile {
     /// remote | local
     pub source_kind: String,
     pub start_url: String,
+    /// 附加到启动地址的查询参数（可选），如 key=value
+    pub start_query: String,
     pub local_dir: Option<String>,
     pub fullscreen: bool,
     pub status_bar_color: String,
@@ -143,6 +145,7 @@ impl Default for AndroidProfile {
             version_code: 1,
             source_kind: "remote".to_string(),
             start_url: String::new(),
+            start_query: String::new(),
             local_dir: None,
             fullscreen: false,
             status_bar_color: "#1F2430".to_string(),
@@ -332,6 +335,8 @@ pub struct WindowsProfile {
     /// remote | local
     pub source_kind: String,
     pub start_url: String,
+    /// 附加到启动地址的查询参数（可选），如 key=value
+    pub start_query: String,
     pub local_dir: Option<String>,
     /// fixed（指定分辨率）| ratio（固定比例）| fullscreen（全屏）
     pub size_mode: String,
@@ -407,6 +412,7 @@ impl Default for WindowsProfile {
         Self {
             source_kind: "remote".to_string(),
             start_url: String::new(),
+            start_query: String::new(),
             local_dir: None,
             size_mode: "fixed".to_string(),
             width: 1200,

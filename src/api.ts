@@ -72,6 +72,8 @@ export interface AndroidProfile {
   versionCode: number;
   sourceKind: "remote" | "local";
   startUrl: string;
+  /** 附加到启动地址的查询参数（可选），如 key=value */
+  startQuery: string;
   localDir: string | null;
   fullscreen: boolean;
   statusBarColor: string;
@@ -264,6 +266,8 @@ export const DEFAULT_WINDOWS_PERMISSIONS: WindowsPermissions = {
 export interface WindowsProfile {
   sourceKind: "remote" | "local";
   startUrl: string;
+  /** 附加到启动地址的查询参数（可选），如 key=value */
+  startQuery: string;
   localDir: string | null;
   sizeMode: "fixed" | "ratio" | "fullscreen";
   width: number;
@@ -326,6 +330,7 @@ export interface WindowsProfile {
 export const DEFAULT_WINDOWS: WindowsProfile = {
   sourceKind: "remote",
   startUrl: "",
+  startQuery: "",
   localDir: null,
   sizeMode: "fixed",
   width: 1200,
@@ -424,6 +429,7 @@ export const DEFAULT_ANDROID: AndroidProfile = {
   versionCode: 1,
   sourceKind: "remote",
   startUrl: "",
+  startQuery: "",
   localDir: null,
   fullscreen: false,
   statusBarColor: "#1F2430",
@@ -565,6 +571,15 @@ export function adbLaunchApp(serial: string, packageName: string) {
   return invoke<void>("adb_launch_app", { serial, package: packageName });
 }
 
+/** 把前端 dist 推到设备外部目录（files/www），重启应用后由本地服务优先读取 */
+export function adbPushWww(serial: string, packageName: string, localDir: string) {
+  return invoke<string>("adb_push_www", {
+    serial,
+    package: packageName,
+    localDir,
+  });
+}
+
 /** 复制文本到系统剪贴板 */
 export function copyToClipboard(text: string) {
   return invoke<void>("copy_to_clipboard", { text });
@@ -634,6 +649,8 @@ export interface WindowsBuildRequest {
   outputDir: string | null;
   sourceKind: string;
   startUrl: string;
+  /** 附加到启动地址的查询参数（可选），如 key=value */
+  startQuery: string;
   localDir: string | null;
   /** 应用图标（启动屏 logo 缺省时使用） */
   iconPath: string | null;

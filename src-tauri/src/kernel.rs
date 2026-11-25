@@ -72,7 +72,7 @@ fn parse_versions(html: &str) -> Vec<KernelVersion> {
 pub async fn fetch_windows_kernel_versions() -> Result<Vec<KernelVersion>, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let client = reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0 Jianling")
+            .user_agent("Mozilla/5.0 JianLing")
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| e.to_string())?;
@@ -203,7 +203,7 @@ pub async fn download_windows_kernel(
 
         let cab = std::env::temp_dir().join(format!("jianling-webview2-{}.cab", sanitize(&version)));
         let client = reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0 Jianling")
+            .user_agent("Mozilla/5.0 JianLing")
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .map_err(|e| e.to_string())?;

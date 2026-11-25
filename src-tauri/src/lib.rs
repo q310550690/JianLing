@@ -43,6 +43,7 @@ pub fn run() {
             adb::adb_logcat_clear,
             adb::adb_install_apk,
             adb::adb_launch_app,
+            adb::adb_push_www,
             adb::copy_to_clipboard,
             adb::adb_keep_screen,
             adb::adb_installed_packages,

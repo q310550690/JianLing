@@ -11,6 +11,8 @@ import org.json.JSONObject;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -49,7 +51,7 @@ import javax.net.ssl.X509TrustManager;
  * 可把 Origin 改写为上游自身 Origin；http(s) 与 ws(s) 都支持。
  */
 public class LocalServer {
-    private static final String TAG = "JianlingLocal";
+    private static final String TAG = "JianLingLocal";
     private static final String CONFIG_ASSET = "jianling-local-server.json";
     private static final int HEAD_LIMIT = 64 * 1024;
     private static final int BUF_SIZE = 16 * 1024;
@@ -57,6 +59,8 @@ public class LocalServer {
     private static final byte[] CRLF = "\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final AssetManager assets;
+    /** 非空时优先从该目录读页面资源（调试期热推的 dist），缺失的文件回退 APK 内 assets */
+    private final File fileRoot;
     private final String rootPrefix;
     private final String indexName;
     private final String basePath;
@@ -70,6 +74,16 @@ public class LocalServer {
     private static volatile SSLSocketFactory insecureFactory;
 
     public LocalServer(Context context, String rootPrefix, String indexName) throws Exception {
+        this(context, null, rootPrefix, indexName);
+    }
+
+    /**
+     * @param fileRoot 外部资源根目录（如 getExternalFilesDir(null)），非空时优先于 assets；
+     *                 缺失的文件仍回退 APK 内 assets，方便只推部分文件。
+     */
+    public LocalServer(Context context, File fileRoot, String rootPrefix, String indexName)
+            throws Exception {
+        this.fileRoot = fileRoot;
         this.assets = context.getAssets();
         this.rootPrefix = rootPrefix;
         this.indexName = indexName;
@@ -354,6 +368,17 @@ public class LocalServer {
     }
 
     private Asset openAsset(String rel) {
+        // 调试期热推：先看外部目录，没有这个文件再回退 APK 内 assets
+        if (fileRoot != null) {
+            File file = resolveFile(rel);
+            if (file != null) {
+                try {
+                    return new Asset(new FileInputStream(file), file.length());
+                } catch (IOException ignored) {
+                    // 读不到就回退 assets
+                }
+            }
+        }
         long length = -1;
         try {
             AssetFileDescriptor fd = assets.openFd(rel);
@@ -367,6 +392,21 @@ public class LocalServer {
         }
         try {
             return new Asset(assets.open(rel), length);
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    /** 把请求路径映射到外部资源目录里的文件；越界或不存在返回 null。 */
+    private File resolveFile(String rel) {
+        try {
+            File file = new File(fileRoot, rel);
+            String base = fileRoot.getCanonicalPath();
+            String full = file.getCanonicalPath();
+            if (!full.startsWith(base + File.separator)) {
+                return null;
+            }
+            return file.isFile() ? file : null;
         } catch (IOException e) {
             return null;
         }

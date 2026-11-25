@@ -206,6 +206,36 @@ pub fn adb_installed_packages(
     Ok(installed)
 }
 
+/// 把前端 dist 推到设备的应用外部目录（`files/www`），应用重启后由本地服务优先读取。
+/// 免去每次改前端都重新打包 APK；APK 内 assets 作为缺失文件的兜底。
+#[tauri::command]
+pub fn adb_push_www(
+    app: AppHandle,
+    serial: String,
+    package: String,
+    local_dir: String,
+) -> Result<String, String> {
+    let adb = adb_for(&app)?;
+    let dir = PathBuf::from(local_dir.trim());
+    if !dir.is_dir() {
+        return Err(format!("前端 dist 目录不存在：{}", dir.display()));
+    }
+    if !dir.join("index.html").is_file() {
+        return Err(format!("前端 dist 里没有 index.html：{}", dir.display()));
+    }
+    // 先停掉应用，避免它一边读文件一边被替换
+    let _ = run(&adb, &["-s", &serial, "shell", "am", "force-stop", &package]);
+    let parent = format!("/sdcard/Android/data/{package}/files");
+    let remote = format!("{parent}/www");
+    run(&adb, &["-s", &serial, "shell", "mkdir", "-p", &parent])?;
+    run(&adb, &["-s", &serial, "shell", "rm", "-rf", &remote])?;
+    let out = run(
+        &adb,
+        &["-s", &serial, "push", &dir.to_string_lossy(), &remote],
+    )?;
+    Ok(out.trim().to_string())
+}
+
 /// 锁屏会让页面 visible:false，CDP 部分域被节流（看着像卡死）；这里一键常亮。
 #[tauri::command]
 pub fn adb_keep_screen(app: AppHandle, serial: String, on: bool) -> Result<(), String> {

@@ -11,6 +11,7 @@ import {
   adbLaunchApp,
   adbLogcatClear,
   adbLogcatTail,
+  adbPushWww,
   adbWebviewVersion,
   copyToClipboard,
   devtoolsConnect,
@@ -36,6 +37,7 @@ const versionError = ref("");
 const installing = ref(false);
 const launching = ref(false);
 const installMessage = ref("");
+const pushing = ref(false);
 
 const devtools = ref<DevtoolsInfo | null>(null);
 const devtoolsBusy = ref(false);
@@ -58,6 +60,12 @@ const appName = computed(() => android.value?.appName ?? "");
 const basePackage = computed(() => android.value?.packageName ?? "");
 const debugPackage = computed(() =>
   basePackage.value ? `${basePackage.value}.debug` : "",
+);
+
+const distDir = computed(() => android.value?.localDir ?? "");
+/** 只有本地静态资源（含本地服务）才有 dist 可推；远程地址模式没有意义 */
+const canPush = computed(
+  () => android.value?.sourceKind === "local" && !!distDir.value,
 );
 
 const debugApk = computed<BuildRecord | null>(() => {
@@ -183,6 +191,26 @@ async function launch() {
     ElMessage.error(String(e));
   } finally {
     launching.value = false;
+  }
+}
+
+/** 把前端 dist 推到设备（files/www），省去重新打包 APK；应用重启后生效 */
+async function pushDist() {
+  if (!selected.value || !targetPackage.value || !distDir.value) return;
+  pushing.value = true;
+  try {
+    await adbPushWww(selected.value, targetPackage.value, distDir.value);
+    if (targetInstalled.value) {
+      await adbLaunchApp(selected.value, targetPackage.value);
+      ElMessage.success("资源已推送，应用已重启");
+    } else {
+      ElMessage.warning("资源已推送；设备上还没装这个包，装好后再启动即可");
+    }
+    await pullLogs();
+  } catch (e) {
+    ElMessage.error(String(e));
+  } finally {
+    pushing.value = false;
   }
 }
 
@@ -322,10 +350,23 @@ onUnmounted(() => {
 <template>
   <div class="debug-page">
     <header class="head">
-      <el-button text :icon="ArrowLeft" @click="goBack">返回项目</el-button>
+      <button class="back-btn" type="button" title="返回项目" @click="goBack">
+        <el-icon :size="15"><ArrowLeft /></el-icon>
+      </button>
       <div class="head-title">
         <h1 class="title">设备调试 · {{ appName || "未命名项目" }}</h1>
         <p class="subtitle">{{ targetPackage || "未配置包名" }}</p>
+      </div>
+      <div class="head-actions">
+        <el-button
+          v-if="canPush"
+          type="primary"
+          :disabled="!current"
+          :loading="pushing"
+          @click="pushDist"
+        >
+          重新推送资源
+        </el-button>
       </div>
     </header>
 
@@ -351,6 +392,10 @@ onUnmounted(() => {
           <div class="kv-row spaced">
             <span class="kv-key">包名</span>
             <span class="kv-value mono">{{ targetPackage || "未配置包名" }}</span>
+          </div>
+          <div class="kv-row">
+            <span class="kv-key">前端 dist</span>
+            <span class="kv-value mono">{{ distDir || "未配置" }}</span>
           </div>
           <p class="hint">
             正式包只有构建时勾了「WebView 调试」才能被 DevTools 连上；调试包包名带
@@ -532,6 +577,33 @@ onUnmounted(() => {
   border-bottom: 1px solid var(--border-subtle);
 }
 
+.back-btn {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border-default);
+  border-radius: 9px;
+  background: var(--surface-input);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background-color 0.16s var(--ease), color 0.16s var(--ease),
+    border-color 0.16s var(--ease);
+}
+
+.back-btn:hover {
+  background: #ffffff;
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.head-actions {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
 .title {
   margin: 0;
   font-size: 16px;
@@ -549,7 +621,6 @@ onUnmounted(() => {
 .page-body {
   flex: 1;
   min-height: 0;
-  padding: 14px 18px 20px;
 }
 
 .card {

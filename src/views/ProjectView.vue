@@ -58,6 +58,7 @@ interface FormState {
   versionCode: number;
   sourceKind: "remote" | "local";
   startUrl: string;
+  startQuery: string;
   localDir: string;
   fullscreen: boolean;
   statusBarColor: string;
@@ -122,6 +123,7 @@ function emptyForm(): FormState {
     versionCode: DEFAULT_ANDROID.versionCode,
     sourceKind: DEFAULT_ANDROID.sourceKind,
     startUrl: "",
+    startQuery: "",
     localDir: "",
     fullscreen: DEFAULT_ANDROID.fullscreen,
     statusBarColor: DEFAULT_ANDROID.statusBarColor,
@@ -205,6 +207,7 @@ type WinFormState = Omit<WindowsProfile, "localDir" | "certPassword"> & {
 const winForm = ref<WinFormState>({
   sourceKind: DEFAULT_WINDOWS.sourceKind,
   startUrl: "",
+  startQuery: "",
   localDir: "",
   sizeMode: DEFAULT_WINDOWS.sizeMode,
   width: DEFAULT_WINDOWS.width,
@@ -493,6 +496,7 @@ function fillForm(source: Project) {
     versionCode: a.versionCode || 1,
     sourceKind: a.sourceKind === "local" ? "local" : "remote",
     startUrl: a.startUrl ?? "",
+    startQuery: a.startQuery ?? "",
     localDir: a.localDir ?? "",
     fullscreen: a.fullscreen,
     statusBarColor: a.statusBarColor || DEFAULT_ANDROID.statusBarColor,
@@ -561,6 +565,7 @@ function fillForm(source: Project) {
   winForm.value = {
     sourceKind: w.sourceKind === "local" ? "local" : "remote",
     startUrl: w.startUrl ?? "",
+    startQuery: w.startQuery ?? "",
     localDir: w.localDir ?? "",
     sizeMode: w.sizeMode ?? "fixed",
     width: w.width || DEFAULT_WINDOWS.width,
@@ -653,7 +658,8 @@ async function persist(): Promise<Project> {
   const base = project.value ?? newProject(form.value.appName || "未命名项目");
   const updated: Project = {
     ...base,
-    name: base.name || form.value.appName.trim() || "未命名项目",
+    // 项目名跟着「应用名」走：改名后项目管理列表要同步，不能一直留着创建/复制时的旧名
+    name: form.value.appName.trim() || base.name || "未命名项目",
     outputDir: outDir || null,
     updatedAt: Date.now(),
     android: {
@@ -663,6 +669,7 @@ async function persist(): Promise<Project> {
       versionCode: form.value.versionCode,
       sourceKind: form.value.sourceKind,
       startUrl: form.value.startUrl.trim(),
+      startQuery: form.value.startQuery.trim(),
       localDir: form.value.localDir.trim() || null,
       fullscreen: form.value.fullscreen,
       statusBarColor: form.value.statusBarColor,
@@ -717,6 +724,7 @@ async function persist(): Promise<Project> {
     windows: {
       sourceKind: winForm.value.sourceKind,
       startUrl: winForm.value.startUrl.trim(),
+      startQuery: winForm.value.startQuery.trim(),
       localDir: winForm.value.localDir.trim() || null,
       sizeMode: winForm.value.sizeMode,
       width: winForm.value.width,
@@ -1065,6 +1073,7 @@ async function startWindowsBuild() {
       outputDir: saved.outputDir ?? null,
       sourceKind: winForm.value.sourceKind,
       startUrl: winForm.value.startUrl.trim(),
+      startQuery: winForm.value.startQuery.trim(),
       localDir: winForm.value.localDir.trim() || null,
       iconPath: saved.android.iconPath ?? null,
       sizeMode: winForm.value.sizeMode,
@@ -1440,6 +1449,18 @@ onUnmounted(() => {
             打包时整个目录会放进 APK 的 assets/www，由内置本地服务以 http://127.0.0.1 托管。
           </span>
         </div>
+        <div class="field span-2">
+          <span class="field-label">启动参数（可选）</span>
+          <el-input
+            v-model="form.startQuery"
+            placeholder="如 key=value（会追加到启动地址）"
+            clearable
+          />
+          <span class="field-note">
+            按 URL 参数区分版本/环境的场景用：会拼成 …/index.html?key=value，
+            页面重新加载或重启应用后仍带上。
+          </span>
+        </div>
       </div>
     </section>
 
@@ -1482,6 +1503,11 @@ onUnmounted(() => {
         <p class="card-note">
           前缀匹配（最长优先），命中后保留原路径转发到目标地址，http(s) 与 ws(s) 都支持。
           规则会写进 APK，改了要重新打包；后端若校验 Origin，保持「改写 Origin」开启即可。
+        </p>
+        <p class="card-note">
+          前端接入：壳会在页面脚本执行前注入 <code>window.JianLing</code>，用
+          <code>typeof window.JianLing !== 'undefined'</code> 判定是否在壳内；命中后接口走相对路径
+          <code>/api</code>、ws 走同源 <code>ws://127.0.0.1:端口/ws</code>，由上面的规则转发到真实地址。
         </p>
       </div>
     </section>
@@ -2170,6 +2196,18 @@ onUnmounted(() => {
             内容会复制到导出目录的 www/ 下，exe 启动时直接加载本地文件，不依赖服务器。
           </span>
         </div>
+        <div class="field span-2">
+          <span class="field-label">启动参数（可选）</span>
+          <el-input
+            v-model="winForm.startQuery"
+            placeholder="如 key=value（会追加到启动地址）"
+            clearable
+          />
+          <span class="field-note">
+            按 URL 参数区分版本/环境的场景用：会拼成 …/index.html?key=value，
+            页面重新加载或重启应用后仍带上。
+          </span>
+        </div>
       </div>
     </section>
 
@@ -2212,6 +2250,11 @@ onUnmounted(() => {
         <p class="card-note">
           前缀匹配（最长优先），命中后保留原路径转发到目标地址，http(s) 与 ws(s) 都支持。相对路径能直接调通，后端不需要配 CORS；
           若后端会校验 Origin（例如 nginx 只放行自己的域名），保持「改写 Origin」开启即可。
+        </p>
+        <p class="card-note">
+          前端接入：壳会在页面脚本执行前注入 <code>window.JianLing</code>，用
+          <code>typeof window.JianLing !== 'undefined'</code> 判定是否在壳内；命中后接口走相对路径
+          <code>/api</code>、ws 走同源 <code>ws://127.0.0.1:端口/ws</code>，由上面的规则转发到真实地址。
         </p>
       </div>
     </section>
@@ -3087,7 +3130,6 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 14px;
-  margin-bottom: 14px;
 }
 
 .seg {
@@ -3148,9 +3190,9 @@ h1 {
   position: sticky;
   top: 0;
   z-index: 3;
-  margin: 0 0 2px;
-  padding: 2px 0 8px;
+  padding: 14px 0;
   background: var(--surface-solid);
+  margin-bottom: -6px;
 }
 
 /* 分段器：等分整行，点击区域更大 */

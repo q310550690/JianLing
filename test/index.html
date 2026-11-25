@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Jianling 套壳自检</title>
+<title>JianLing 套壳自检</title>
 <style>
   :root { color-scheme: light; }
   * { box-sizing: border-box; }
@@ -36,7 +36,7 @@
 <body>
 
 <header>
-  <h1>Jianling 套壳自检</h1>
+  <h1>JianLing 套壳自检</h1>
   <button onclick="copyReport()">复制报告</button>
   <button onclick="resetAll()">清空结果</button>
 </header>
@@ -292,11 +292,11 @@ function askGeo() {
 
 function askNotify() {
   // WebView 不支持 Notification API，通知权限只能走壳桥：先出顶部说明，再弹系统授权框
-  if (!window.Jianling || !window.Jianling.requestPermission) {
-    record('notify', false, '当前壳没有 Jianling.requestPermission');
+  if (!window.JianLing || !window.JianLing.requestPermission) {
+    record('notify', false, '当前壳没有 JianLing.requestPermission');
     return;
   }
-  var r = window.Jianling.requestPermission('notification');
+  var r = window.JianLing.requestPermission('notification');
   if (r === 'requested') { record('notify', null, '已请求：看顶部说明卡片 + 系统框'); return; }
   if (r === 'granted') { record('notify', true, '无需申请：系统已授予，或该 Android 版本没有通知运行时权限'); return; }
   record('notify', false, '壳桥不支持：' + r);

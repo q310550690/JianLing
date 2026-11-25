@@ -70,9 +70,11 @@ import androidx.webkit.WebViewCompat;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.FileOutputStream;
 import java.io.OutputStream;
+import java.net.URLConnection;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -101,7 +103,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = "MainActivity";
 
     /**
-     * 壳行为开关（打包时由 Jianling 注入）
+     * 壳行为开关（打包时由 JianLing 注入）
      */
     private static final boolean FULLSCREEN = __FULLSCREEN__;
     /**
@@ -121,7 +123,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String UA_SUFFIX = "__UA_SUFFIX__";
 
     /**
-     * 浏览器行为开关（打包时由 Jianling 注入）
+     * 浏览器行为开关（打包时由 JianLing 注入）
      */
     private static final boolean USE_ASSET_LOADER = __USE_ASSET_LOADER__;
     private static final int TEXT_ZOOM = __TEXT_ZOOM__;
@@ -137,6 +139,10 @@ public class MainActivity extends AppCompatActivity {
     /** append（默认 UA + 应用标记）| override（整串替换） */
     private static final String UA_MODE = "__UA_MODE__";
     private static final String USER_AGENT = "__USER_AGENT__";
+    /** 静态资源目录名：APK 内是 assets/www，调试期热推落在 files/www */
+    private static final String RESOURCE_DIR = "www";
+    /** 附加到启动地址的查询参数（可选），如 key=value */
+    private static final String START_QUERY = "__START_QUERY__";
     private static final boolean PULL_TO_REFRESH = __PULL_TO_REFRESH__;
     private static final boolean EXIT_ON_BACK = __EXIT_ON_BACK__;
     /** 禁止返回键退出应用：网页退不了时返回键被吃掉，既不退出也不提示 */
@@ -147,14 +153,14 @@ public class MainActivity extends AppCompatActivity {
     private static final boolean NAV_BAR = __NAV_BAR__;
 
     /**
-     * 显示类开关（打包时由 Jianling 注入）
+     * 显示类开关（打包时由 JianLing 注入）
      */
     private static final boolean LIGHT_STATUS_BAR = __LIGHT_STATUS_BAR__;
     private static final boolean KEEP_SCREEN_ON = __KEEP_SCREEN_ON__;
     private static final boolean SECURE_FLAG = __SECURE_FLAG__;
 
     /**
-     * 每项权限的用途说明配置（JSON，打包时由 Jianling 注入）。
+     * 每项权限的用途说明配置（JSON，打包时由 JianLing 注入）。
      * 形如：{"camera":{"enabled":true,"title":"相机权限","message":"..."}}
      */
     private static final String PERMISSION_PROMPTS_JSON = "__PERMISSION_PROMPTS_JSON__";
@@ -762,6 +768,14 @@ public class MainActivity extends AppCompatActivity {
     // ========================================================================
     // WebView 初始化 + WebSettings / WebChromeClient / WebViewClient（VIA 同款配置）
     // ========================================================================
+    /** 启动地址附加配置的查询参数（已自动处理 ? / &） */
+    private String withStartQuery(String url) {
+        if (url == null || START_QUERY == null || START_QUERY.isEmpty()) {
+            return url;
+        }
+        return url + (url.contains("?") ? "&" : "?") + START_QUERY;
+    }
+
     private void initWebView() {
         try {
             mWebView = findViewById(R.id.webView);
@@ -797,7 +811,7 @@ public class MainActivity extends AppCompatActivity {
                     hideErrorView();
                     String url = mLastFailedUrl != null
                             ? mLastFailedUrl
-                            : (mLocalServerUrl != null ? mLocalServerUrl : DEFAULT_URL);
+                            : withStartQuery(mLocalServerUrl != null ? mLocalServerUrl : DEFAULT_URL);
                     mWebView.loadUrl(url);
                 });
             }
@@ -866,7 +880,7 @@ public class MainActivity extends AppCompatActivity {
             // 缓存策略（HTTP cache + IDB / LocalStorage，W3C AppCache 在 compileSdk 33+ 已移除公开 API）
             settings.setCacheMode(cacheModeValue());
 
-            // 缩放（Jianling 可关闭）
+            // 缩放（JianLing 可关闭）
             settings.setSupportZoom(ALLOW_ZOOM);
             settings.setBuiltInZoomControls(ALLOW_ZOOM);
             settings.setDisplayZoomControls(false);
@@ -875,7 +889,7 @@ public class MainActivity extends AppCompatActivity {
             settings.setUseWideViewPort(true);
             settings.setLoadWithOverviewMode(true);
 
-            // 字体缩放（100 = 跟随系统；Jianling 可注入 50–200 解决"最小字太小"）
+            // 字体缩放（100 = 跟随系统；JianLing 可注入 50–200 解决"最小字太小"）
             settings.setTextZoom(TEXT_ZOOM);
 
             // 多窗口 / 小窗模式
@@ -914,18 +928,31 @@ public class MainActivity extends AppCompatActivity {
             // 本地静态包：WebViewAssetLoader 走 https://appassets.androidplatform.net/assets/，
             // 规避 file:// 下 localStorage / XHR / 跨域的各种限制
             if (USE_ASSET_LOADER) {
+                // 调试期「重新推送资源」把 dist 推到 files/www；有 index.html 就优先读外部目录
+                File pushedRoot = getExternalFilesDir(null);
+                boolean usePushed = pushedRoot != null
+                        && new File(new File(pushedRoot, RESOURCE_DIR), "index.html").isFile();
+                if (usePushed) {
+                    Log.i(TAG, "使用外部推送资源: "
+                            + new File(pushedRoot, RESOURCE_DIR).getAbsolutePath());
+                }
                 // 优先启用内置本地服务：页面与 /api、/ws 同源，免 CORS、免改前端 base。
                 // 启动失败（例如没写配置）时退回 WebViewAssetLoader。
                 try {
-                    mLocalServer = new LocalServer(this, "www", "index.html");
+                    mLocalServer = usePushed
+                            ? new LocalServer(this, pushedRoot, RESOURCE_DIR, "index.html")
+                            : new LocalServer(this, RESOURCE_DIR, "index.html");
                     int port = mLocalServer.start();
                     mLocalServerUrl = "http://127.0.0.1:" + port + mLocalServer.getBasePath() + "index.html";
                 } catch (Exception e) {
                     Log.w(TAG, "本地服务启动失败，回退 WebViewAssetLoader: " + e.getMessage());
                     mLocalServer = null;
                     mLocalServerUrl = null;
+                    WebViewAssetLoader.PathHandler assetsHandler =
+                            new WebViewAssetLoader.AssetsPathHandler(this);
                     mAssetLoader = new WebViewAssetLoader.Builder()
-                            .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                            .addPathHandler("/assets/",
+                                    new PushedAssetsHandler(pushedRoot, assetsHandler))
                             .build();
                 }
             }
@@ -946,8 +973,8 @@ public class MainActivity extends AppCompatActivity {
                 settings.setUserAgentString(composed);
             }
 
-            // H5 → 壳的原生桥：window.Jianling.*（方法内部按当前页面来源校验）
-            mWebView.addJavascriptInterface(new JianlingBridge(), "Jianling");
+            // H5 → 壳的原生桥：window.JianLing.*（方法内部按当前页面来源校验）
+            mWebView.addJavascriptInterface(new JianLingBridge(), "JianLing");
 
             // —— 下载监听 ——
             // 普通 http(s) 文件交给系统 DownloadManager（自带进度通知 + 落到系统「下载」目录）；
@@ -1365,7 +1392,7 @@ public class MainActivity extends AppCompatActivity {
 
             // 最后加载默认 URL：本地服务已启动时走 127.0.0.1，否则用打包时注入的地址。
             // 启用启动屏时先展示静态 HTML，到点后再切到真正的页面。
-            String targetUrl = mLocalServerUrl != null ? mLocalServerUrl : DEFAULT_URL;
+            String targetUrl = withStartQuery(mLocalServerUrl != null ? mLocalServerUrl : DEFAULT_URL);
             if (!Splash.loadInto(this, mWebView, targetUrl)) {
                 mWebView.loadUrl(targetUrl);
             }
@@ -1551,7 +1578,7 @@ public class MainActivity extends AppCompatActivity {
                 + ",m=" + JSONObject.quote(mimetype == null ? "" : mimetype) + ";"
                 + "fetch(u).then(function(r){return r.blob();}).then(function(b){"
                 + "var fr=new FileReader();fr.onload=function(){var s=String(fr.result||'');"
-                + "var i=s.indexOf(',');Jianling.saveDownload(n,m,i>=0?s.substring(i+1):'');};"
+                + "var i=s.indexOf(',');JianLing.saveDownload(n,m,i>=0?s.substring(i+1):'');};"
                 + "fr.readAsDataURL(b);})"
                 + ".catch(function(e){console.error('saveDownload failed: '+e);});})();";
         mWebView.evaluateJavascript(js, null);
@@ -1905,10 +1932,48 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /**
-     * H5 可用的原生能力（window.Jianling.xxx）。
+     * 静态资源加载：优先读外部推送目录（files/www），没有该文件再回退 APK 内 assets。
+     * 用于关闭本地服务时（WebViewAssetLoader 走 appassets.androidplatform.net）的调试热推。
+     */
+    private static final class PushedAssetsHandler implements WebViewAssetLoader.PathHandler {
+        private final File root;
+        private final WebViewAssetLoader.PathHandler fallback;
+
+        PushedAssetsHandler(File root, WebViewAssetLoader.PathHandler fallback) {
+            this.root = root;
+            this.fallback = fallback;
+        }
+
+        @Override
+        public WebResourceResponse handle(String path) {
+            if (root != null) {
+                try {
+                    File file = new File(root, path);
+                    String base = root.getCanonicalPath();
+                    String full = file.getCanonicalPath();
+                    if (full.startsWith(base + File.separator) && file.isFile()) {
+                        String mime = URLConnection.guessContentTypeFromName(path);
+                        if (mime == null) {
+                            mime = "application/octet-stream";
+                        }
+                        String encoding = mime.startsWith("text/")
+                                || mime.contains("javascript")
+                                || mime.contains("json") ? "UTF-8" : null;
+                        return new WebResourceResponse(mime, encoding, new FileInputStream(file));
+                    }
+                } catch (Exception ignored) {
+                    // 读不到就走 assets
+                }
+            }
+            return fallback.handle(path);
+        }
+    }
+
+    /**
+     * H5 可用的原生能力（window.JianLing.xxx）。
      * 每个方法都校验当前页面来源，非本站页面调用直接忽略。
      */
-    public class JianlingBridge {
+    public class JianLingBridge {
         private boolean trusted() {
             // 桥方法在后台线程回调，不能调 WebView.getUrl()，用 UI 线程缓存的地址
             return isTrustedUrl(mCurrentPageUrl);

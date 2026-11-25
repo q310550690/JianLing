@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Jianling design tokens — light acrylic
+   JianLing design tokens — light acrylic
    Style: Minimalism / Swiss  ·  Accent: forest green
    ========================================================================== */
 :root {
@@ -59,7 +59,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 20px;
-  padding: 14px var(--content-pad);
+  padding: 14px;
   border-bottom: 1px solid var(--border-subtle);
   background: rgba(255, 255, 255, 0.5);
 }
@@ -71,7 +71,7 @@
 }
 
 .page-body .el-scrollbar__view {
-  padding: 14px var(--content-pad);
+  padding: 14px;
 }
 
 .page-body .el-scrollbar__wrap {

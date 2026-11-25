@@ -56,6 +56,9 @@ pub struct AndroidBuildRequest {
     pub version_name: String,
     pub version_code: u32,
     pub start_url: String,
+    /// 附加到启动地址的查询参数（可选），如 key=value
+    #[serde(default)]
+    pub start_query: String,
     pub fullscreen: bool,
     pub status_bar_color: String,
     #[serde(default = "default_true")]
@@ -1088,6 +1091,11 @@ pub fn run_build(app: &AppHandle, req: AndroidBuildRequest) -> Result<BuildResul
     } else {
         req.start_url.trim().to_string()
     };
+    let start_query = req
+        .start_query
+        .trim()
+        .trim_start_matches(|c: char| c == '?' || c == '&')
+        .to_string();
 
     // SDK 版本：给出上下限，避免写成 Gradle 不认的组合
     let compile_sdk = req.compile_sdk.clamp(30, 36);
@@ -1259,6 +1267,7 @@ pub fn run_build(app: &AppHandle, req: AndroidBuildRequest) -> Result<BuildResul
         ("__APP_NAME__", xml_escape(&app_name)),
         ("__FILE_CHOOSER_TITLE__", "选择文件".to_string()),
         ("__START_URL__", start_url),
+        ("__START_QUERY__", escape_java(&start_query)),
         ("__FULLSCREEN__", req.fullscreen.to_string()),
         ("__STATUS_BAR_COLOR__", normalize_color(&req.status_bar_color)),
         ("__EDGE_TO_EDGE__", req.edge_to_edge.to_string()),
@@ -1712,6 +1721,9 @@ pub struct WindowsBuildRequest {
     pub output_dir: Option<String>,
     pub source_kind: String,
     pub start_url: String,
+    /// 附加到启动地址的查询参数（可选），如 key=value
+    #[serde(default)]
+    pub start_query: String,
     pub local_dir: Option<String>,
     /// 应用图标（启动屏 logo 缺省时使用）
     #[serde(default)]
@@ -2337,6 +2349,10 @@ fn run_build_windows(
     let config = serde_json::json!({
         "title": request.app_name.trim(),
         "url": request.start_url.trim(),
+        "startQuery": request
+            .start_query
+            .trim()
+            .trim_start_matches(|c: char| c == '?' || c == '&'),
         "localIndex": local_index,
         "width": win_width as f64,
         "height": win_height as f64,

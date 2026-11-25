@@ -23,7 +23,7 @@ import java.util.Locale;
  * 因此不依赖本地服务，也不受 file:// 与跨域限制。
  */
 final class Splash {
-    private static final String TAG = "JianlingSplash";
+    private static final String TAG = "JianLingSplash";
     private static final String CONFIG_ASSET = "jianling-splash.json";
 
     private Splash() {
