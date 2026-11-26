@@ -29,6 +29,20 @@ fn default_target_sdk() -> u32 {
     34
 }
 
+fn default_back_mode() -> String {
+    "auto".to_string()
+}
+
+/// 返回键策略：只接受 auto / web / exit / none，其它值一律按 auto（会被注入 Java 常量）
+fn normalize_back_mode(value: &str) -> String {
+    match value.trim() {
+        "web" => "web".to_string(),
+        "exit" => "exit".to_string(),
+        "none" => "none".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
 fn default_compile_sdk() -> u32 {
     34
 }
@@ -104,6 +118,8 @@ pub struct AndroidBuildRequest {
     pub exit_on_back_pressed: bool,
     #[serde(default)]
     pub disable_back_exit: bool,
+    #[serde(default = "default_back_mode")]
+    pub back_mode: String,
     #[serde(default)]
     pub progress_bar: bool,
     #[serde(default = "default_progress_color")]
@@ -1326,6 +1342,7 @@ pub fn run_build(app: &AppHandle, req: AndroidBuildRequest) -> Result<BuildResul
         ("__PULL_TO_REFRESH__", req.pull_to_refresh.to_string()),
         ("__EXIT_ON_BACK__", req.exit_on_back_pressed.to_string()),
         ("__DISABLE_BACK_EXIT__", req.disable_back_exit.to_string()),
+        ("__BACK_MODE__", normalize_back_mode(&req.back_mode)),
         ("__PROGRESS_BAR__", req.progress_bar.to_string()),
         (
             "__PROGRESS_COLOR__",

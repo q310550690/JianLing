@@ -8,6 +8,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+  adbDevices,
+  adbInstallApk,
   buildAndroid,
   buildWindows,
   DEFAULT_ANDROID,
@@ -25,6 +27,7 @@ import {
   saveSettings,
 } from "../api";
 import type {
+  AdbDevice,
   BuildRecord,
   BuildResult,
   LocalServerConfig,
@@ -88,8 +91,8 @@ interface FormState {
   uaMode: "append" | "override";
   userAgent: string;
   pullToRefresh: boolean;
-  exitOnBackPressed: boolean;
-  disableBackExit: boolean;
+  /** 返回键策略：auto 自动 | web 仅网页后退 | exit 仅退出 | none 不响应返回键 */
+  backMode: "auto" | "web" | "exit" | "none";
   progressBar: boolean;
   progressColor: string;
   progressHeight: number;
@@ -152,8 +155,7 @@ function emptyForm(): FormState {
     uaMode: DEFAULT_ANDROID.uaMode,
     userAgent: DEFAULT_ANDROID.userAgent,
     pullToRefresh: DEFAULT_ANDROID.pullToRefresh,
-    exitOnBackPressed: DEFAULT_ANDROID.exitOnBackPressed,
-    disableBackExit: DEFAULT_ANDROID.disableBackExit,
+    backMode: DEFAULT_ANDROID.backMode,
     progressBar: DEFAULT_ANDROID.progressBar,
     progressColor: DEFAULT_ANDROID.progressColor,
     progressHeight: DEFAULT_ANDROID.progressHeight,
@@ -174,6 +176,7 @@ function emptyForm(): FormState {
 }
 
 const form = ref<FormState>(emptyForm());
+
 const outputDir = ref("");
 const ready = ref(false);
 const passwords = ref({ store: "", key: "" });
@@ -189,6 +192,16 @@ const buildError = ref("");
 const winBuildError = ref("");
 const logs = ref<{ stream: string; line: string }[]>([]);
 const winLogs = ref<{ stream: string; line: string }[]>([]);
+/** 构建成功后的「安装到设备」：设备列表 + 安装状态 */
+const devices = ref<AdbDevice[]>([]);
+const selectedDevice = ref("");
+const loadingDevices = ref(false);
+const devicesError = ref("");
+const installing = ref(false);
+const installMessage = ref("");
+/** 安装到设备弹窗：目标构建记录 */
+const installOpen = ref(false);
+const installRecord = ref<BuildRecord | null>(null);
 const logBox = ref<HTMLElement | null>(null);
 const logVisible = ref(false);
 /** 历史记录日志弹窗：展示某个 build.log 的文件内容，首行是日志路径 */
@@ -525,8 +538,13 @@ function fillForm(source: Project) {
     uaMode: a.uaMode ?? DEFAULT_ANDROID.uaMode,
     userAgent: a.userAgent ?? "",
     pullToRefresh: a.pullToRefresh ?? DEFAULT_ANDROID.pullToRefresh,
-    exitOnBackPressed: a.exitOnBackPressed ?? DEFAULT_ANDROID.exitOnBackPressed,
-    disableBackExit: a.disableBackExit ?? DEFAULT_ANDROID.disableBackExit,
+    // 旧配置的「禁止返回键退出应用」等价于「仅网页后退」，双击退出已并入策略
+    backMode:
+      a.backMode === "web" || a.backMode === "exit" || a.backMode === "none"
+        ? a.backMode
+        : a.disableBackExit
+          ? "web"
+          : "auto",
     progressBar: a.progressBar ?? DEFAULT_ANDROID.progressBar,
     progressColor: a.progressColor || DEFAULT_ANDROID.progressColor,
     progressHeight: a.progressHeight || DEFAULT_ANDROID.progressHeight,
@@ -700,8 +718,10 @@ async function persist(): Promise<Project> {
       uaMode: form.value.uaMode,
       userAgent: form.value.userAgent.trim(),
       pullToRefresh: form.value.pullToRefresh,
-      exitOnBackPressed: form.value.exitOnBackPressed,
-      disableBackExit: form.value.disableBackExit,
+      // 双击退出只对「自动」和「仅退出」生效；只后退 / 不响应的策略不退出
+      exitOnBackPressed: form.value.backMode === "auto" || form.value.backMode === "exit",
+      disableBackExit: form.value.backMode === "web" || form.value.backMode === "none",
+      backMode: form.value.backMode,
       progressBar: form.value.progressBar,
       progressColor: form.value.progressColor,
       progressHeight: form.value.progressHeight,
@@ -1037,6 +1057,52 @@ async function startBuild(debugBuild = false) {
   }
 }
 
+const currentDevice = computed(
+  () => devices.value.find((d) => d.serial === selectedDevice.value) ?? null,
+);
+
+async function refreshDevices() {
+  loadingDevices.value = true;
+  devicesError.value = "";
+  try {
+    devices.value = await adbDevices();
+    if (!devices.value.some((d) => d.serial === selectedDevice.value)) {
+      selectedDevice.value =
+        (devices.value.find((d) => d.state === "device") ?? devices.value[0])?.serial ?? "";
+    }
+  } catch (e) {
+    devicesError.value = String(e);
+    devices.value = [];
+    selectedDevice.value = "";
+  } finally {
+    loadingDevices.value = false;
+  }
+}
+
+/** 把构建历史里的 APK 装到选中的设备上 */
+async function installToDevice() {
+  const apkPath = installRecord.value?.apkPath;
+  if (!apkPath || !selectedDevice.value) return;
+  installing.value = true;
+  installMessage.value = "";
+  try {
+    installMessage.value = await adbInstallApk(selectedDevice.value, apkPath);
+    ElMessage.success("安装完成");
+  } catch (e) {
+    installMessage.value = String(e);
+    ElMessage.error("安装失败");
+  } finally {
+    installing.value = false;
+  }
+}
+
+function openInstall(record: BuildRecord) {
+  installRecord.value = record;
+  installMessage.value = "";
+  installOpen.value = true;
+  void refreshDevices();
+}
+
 function clearLogs() {
   if (activeTab.value === "android") {
     logs.value = [];
@@ -1221,6 +1287,11 @@ watch(
     result.value = null;
     winResult.value = null;
     logVisible.value = false;
+    installOpen.value = false;
+    installRecord.value = null;
+    installMessage.value = "";
+    devices.value = [];
+    selectedDevice.value = "";
     passwords.value = { store: "", key: "" };
     load();
   },
@@ -1619,22 +1690,6 @@ onUnmounted(() => {
         </div>
         <div class="toggle">
           <div class="toggle-text">
-            <div class="toggle-name">返回键双击退出</div>
-            <div class="toggle-desc">无法后退时提示「再按一次退出」</div>
-          </div>
-          <el-switch v-model="form.exitOnBackPressed" :disabled="form.disableBackExit" />
-        </div>
-        <div class="toggle">
-          <div class="toggle-text">
-            <div class="toggle-name">禁止返回键退出应用</div>
-            <div class="toggle-desc">
-              开启后返回键只做网页后退，退不动时按返回键不会退出应用（上面的双击退出失效）
-            </div>
-          </div>
-          <el-switch v-model="form.disableBackExit" />
-        </div>
-        <div class="toggle">
-          <div class="toggle-text">
             <div class="toggle-name">屏幕常亮</div>
             <div class="toggle-desc">使用期间不自动息屏</div>
           </div>
@@ -1706,7 +1761,7 @@ onUnmounted(() => {
         <div class="toggle">
           <div class="toggle-text">
             <div class="toggle-name">开启调试</div>
-            <div class="toggle-desc risk">允许调试器连接，正式包建议关闭</div>
+            <div class="toggle-desc risk">允许调试器连接，并把返回键判定（canGoBack / history 长度 / 后退前后地址）写入 logcat；正式包建议关闭</div>
           </div>
           <el-switch v-model="form.debugEnabled" />
         </div>
@@ -1725,6 +1780,36 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="fields spaced">
+        <label class="field span-2">
+          <span class="field-label">返回键策略</span>
+          <el-select v-model="form.backMode" popper-class="back-mode-popper">
+            <el-option value="auto" label="自动（推荐）">
+              <div class="back-opt">
+                <span>自动（推荐）</span>
+                <span class="back-opt-desc">能后退就后退；退不动时提示再按一次退出</span>
+              </div>
+            </el-option>
+            <el-option value="web" label="仅网页后退">
+              <div class="back-opt">
+                <span>仅网页后退</span>
+                <span class="back-opt-desc">只做网页后退，退不动时保持当前页面</span>
+              </div>
+            </el-option>
+            <el-option value="exit" label="仅退出">
+              <div class="back-opt">
+                <span>仅退出</span>
+                <span class="back-opt-desc">不后退，直接退出应用（首次按提示再按一次）</span>
+              </div>
+            </el-option>
+            <el-option value="none" label="不响应返回键">
+              <div class="back-opt">
+                <span>不响应返回键</span>
+                <span class="back-opt-desc">返回键无任何反应，应用不后退也不退出</span>
+              </div>
+            </el-option>
+          </el-select>
+          <span class="field-note">一般保持「自动」；只有自动判错时才需要手动指定</span>
+        </label>
         <label class="field span-2">
           <span class="field-label">缓存模式</span>
           <el-select v-model="form.cacheMode">
@@ -2055,63 +2140,6 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section v-show="androidTab === 'build'" class="card" :class="{ 'card-failed': !!buildError }">
-      <div class="card-head">
-        <span class="card-title">
-          构建 APK
-          <span v-if="buildError" class="failed-tag">构建失败</span>
-          <span v-else-if="building" class="running-tag">构建中…</span>
-        </span>
-        <div class="build-actions">
-          <el-button v-if="building || logs.length" @click="logVisible = true">
-            构建日志
-            <span v-if="logs.length" class="log-count">{{ logs.length }}</span>
-          </el-button>
-        </div>
-      </div>
-
-      <div v-if="buildError" class="build-error">
-        <div class="build-error-head">
-          <span class="build-error-title">构建失败</span>
-          <el-button size="small" @click="logVisible = true">查看日志</el-button>
-        </div>
-        <div class="build-error-msg mono">{{ buildError }}</div>
-      </div>
-
-      <div v-if="result" class="result">
-        <div class="stats">
-          <div class="stat">
-            <span class="k">大小</span>
-            <span class="v mono">{{ mb(result.sizeBytes) }} MB</span>
-          </div>
-          <div class="stat">
-            <span class="k">签名</span>
-            <span class="v" :class="result.signed ? 'ok' : 'warn'">
-              {{ result.signed ? "正式签名" : "调试签名" }}
-            </span>
-          </div>
-          <div class="stat">
-            <span class="k">耗时</span>
-            <span class="v mono">{{ result.durationSecs }}s</span>
-          </div>
-          <div class="stat artifact">
-            <span class="k">产物</span>
-            <div class="artifact-row">
-              <span class="artifact-path mono" :title="result.apkPath">{{ result.apkPath }}</span>
-              <el-button size="small" :icon="FolderOpened" @click="reveal(result.apkPath)">
-                打开
-              </el-button>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <p v-else-if="!building" class="build-hint">
-        点右上角「构建 Android」生成 APK，过程日志在「构建日志」里查看。
-      </p>
-      <p v-else class="build-hint live">正在构建，日志实时输出到「构建日志」。</p>
-    </section>
-
     <section v-show="androidTab === 'build'" class="card">
       <div class="card-head">
         <span class="card-title">构建历史</span>
@@ -2144,6 +2172,7 @@ onUnmounted(() => {
           <span v-if="item.failed" class="hist-path mono err" :title="item.error">{{ item.error }}</span>
           <span v-else class="hist-path mono" :title="item.apkPath">{{ item.apkPath }}</span>
           <el-button v-if="!item.failed" size="small" @click="reveal(item.apkPath)">打开</el-button>
+          <el-button v-if="!item.failed" size="small" @click="openInstall(item)">安装</el-button>
           <el-button
             v-if="!item.failed && item.apkPath.endsWith('-debug.apk')"
             size="small"
@@ -3004,6 +3033,54 @@ onUnmounted(() => {
         <el-button type="primary" @click="fileLogVisible = false">关闭</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog
+      v-model="installOpen"
+      title="安装到设备"
+      width="min(520px, 92vw)"
+      align-center
+    >
+      <div v-if="installRecord" class="install-target mono" :title="installRecord.apkPath">
+        {{ installRecord.apkPath }}
+      </div>
+      <div class="install-head">
+        <span class="install-title">选择设备</span>
+        <el-button size="small" :loading="loadingDevices" @click="refreshDevices">
+          刷新设备
+        </el-button>
+      </div>
+      <div v-if="devicesError" class="device-error">{{ devicesError }}</div>
+      <div v-else-if="!devices.length" class="device-empty">
+        没有检测到设备：确认 USB 调试已开启、数据线可传数据。
+      </div>
+      <div v-else class="device-list">
+        <div
+          v-for="device in devices"
+          :key="device.serial"
+          class="device"
+          :class="{ active: device.serial === selectedDevice }"
+          @click="selectedDevice = device.serial"
+        >
+          <div>
+            <div class="device-model">{{ device.model || device.serial }}</div>
+            <div class="device-serial">{{ device.serial }}</div>
+          </div>
+          <span class="device-state" :class="device.state">{{ device.state }}</span>
+        </div>
+      </div>
+      <div v-if="installMessage" class="device-msg">{{ installMessage }}</div>
+      <template #footer>
+        <el-button @click="installOpen = false">取消</el-button>
+        <el-button
+          type="primary"
+          :disabled="!currentDevice"
+          :loading="installing"
+          @click="installToDevice"
+        >
+          {{ installing ? "安装中…" : "安装到设备" }}
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -3303,6 +3380,24 @@ h1 {
 .field-note {
   font-size: 11.5px;
   line-height: 1.5;
+  color: var(--text-faint);
+}
+
+/* 返回键策略下拉：每个选项后附一句说明 */
+:global(.back-mode-popper .el-select-dropdown__item) {
+  height: auto;
+  padding: 6px 12px;
+  line-height: 1.45;
+}
+
+.back-opt {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.back-opt-desc {
+  font-size: 11px;
   color: var(--text-faint);
 }
 
@@ -3642,6 +3737,112 @@ h1 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 构建历史「安装」弹窗 */
+.install-target {
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.install-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.install-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.device {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+  cursor: pointer;
+}
+
+.device.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.device-model {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.device-serial {
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.device-state {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.device-state.device {
+  background: rgba(46, 125, 50, 0.12);
+  color: #2e7d32;
+}
+
+.device-state.unauthorized,
+.device-state.offline {
+  background: rgba(214, 82, 82, 0.12);
+  color: #d65252;
+}
+
+.device-empty {
+  padding: 8px 0;
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+
+.device-error {
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  background: rgba(214, 82, 82, 0.08);
+  color: #b23c3c;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.device-msg {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  word-break: break-all;
 }
 
 .log {

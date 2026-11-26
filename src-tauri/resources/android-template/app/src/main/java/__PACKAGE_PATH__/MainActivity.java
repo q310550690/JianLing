@@ -147,6 +147,12 @@ public class MainActivity extends AppCompatActivity {
     private static final boolean EXIT_ON_BACK = __EXIT_ON_BACK__;
     /** 禁止返回键退出应用：网页退不了时返回键被吃掉，既不退出也不提示 */
     private static final boolean DISABLE_BACK_EXIT = __DISABLE_BACK_EXIT__;
+    /**
+     * 返回键策略：auto（原生历史优先，退不了再让网页后退一次）|
+     * web（只走网页 history.back()）| exit（不后退，直接按退出处理）|
+     * none（返回键被吃掉，无任何反应）
+     */
+    private static final String BACK_MODE = "__BACK_MODE__";
     private static final boolean PROGRESS_BAR = __PROGRESS_BAR__;
     private static final String PROGRESS_COLOR = "__PROGRESS_COLOR__";
     private static final int PROGRESS_HEIGHT_DP = __PROGRESS_HEIGHT__;
@@ -211,6 +217,13 @@ public class MainActivity extends AppCompatActivity {
      * 返回键双击退出的时间戳
      */
     private long mLastBackPressedAt = 0L;
+
+    /**
+     * 正在探测「网页自身还能不能后退」。
+     * 部分系统 WebView 不把 hash 路由 / history.pushState 的站内跳转计入 canGoBack()，
+     * 这时先让页面 history.back() 一次，再确认地址有没有变，避免误判成「退无可退」。
+     */
+    private boolean mBackProbeRunning = false;
 
     /**
      * 本地静态包模式下的资源加载器（https://appassets.androidplatform.net/assets/）。
@@ -1778,28 +1791,152 @@ public class MainActivity extends AppCompatActivity {
                 _exitVideoFullscreen();
                 return true;
             }
-            if (keyCode == KeyEvent.KEYCODE_BACK && mWebView != null && mWebView.canGoBack()) {
-                mWebView.goBack();
-                return true;
-            }
-            if (keyCode == KeyEvent.KEYCODE_BACK && DISABLE_BACK_EXIT) {
-                // 已经无处可退，按配置把返回键吃掉
-                return true;
-            }
-            if (keyCode == KeyEvent.KEYCODE_BACK && EXIT_ON_BACK && mWebView != null) {
-                long now = System.currentTimeMillis();
-                if (now - mLastBackPressedAt < 2000L) {
-                    finish();
-                    return true;
-                }
-                mLastBackPressedAt = now;
-                Toast.makeText(this, "再按一次退出", Toast.LENGTH_SHORT).show();
+            if (keyCode == KeyEvent.KEYCODE_BACK && _handleBackNavigation()) {
                 return true;
             }
         } catch (Exception e) {
             Log.w(TAG, "onKeyDown error: " + e.getMessage());
         }
         return super.onKeyDown(keyCode, event);
+    }
+
+    /**
+     * 返回键的网页后退，按打包时选择的策略分派：
+     *   auto：先走 WebView 原生历史，不行再让网页 history.back() 试一次；
+     *   web：跳过 canGoBack()，直接让网页后退；
+     *   exit：不后退，直接进入「退无可退」的退出处理。
+     * 之所以需要网页兜底：部分系统 WebView（如 Android 13 + com.android.webview 101）
+     * 不会把 hash 路由 / history.pushState 产生的站内跳转计入 canGoBack()。
+     * 返回 true 表示本次返回键已被消费（正在后退或已给出提示）。
+     */
+    private boolean _handleBackNavigation() {
+        if (mWebView == null) {
+            return _handleBackExit();
+        }
+        if ("none".equals(BACK_MODE)) {
+            if (DEBUG_ENABLED) {
+                Log.i(TAG, "back: mode=none, key ignored");
+            }
+            return true;
+        }
+        if ("exit".equals(BACK_MODE)) {
+            if (DEBUG_ENABLED) {
+                Log.i(TAG, "back: mode=exit, skip web back");
+            }
+            return _handleBackExit();
+        }
+        if (!"web".equals(BACK_MODE) && mWebView.canGoBack()) {
+            if (DEBUG_ENABLED) {
+                Log.i(TAG, "back: mode=" + BACK_MODE + " native goBack, url=" + mWebView.getUrl());
+            }
+            mWebView.goBack();
+            return true;
+        }
+        // 上一次网页后退探测还没结束时，忽略连续按键，避免一次按退回多页
+        if (mBackProbeRunning) {
+            if (DEBUG_ENABLED) {
+                Log.i(TAG, "back: probe already running, key ignored");
+            }
+            return true;
+        }
+        final String url = mWebView.getUrl();
+        if (url == null) {
+            return _handleBackExit();
+        }
+        if (DEBUG_ENABLED) {
+            Log.i(TAG, "back: mode=" + BACK_MODE + " probing web history, url=" + url);
+        }
+        mBackProbeRunning = true;
+        try {
+            mWebView.evaluateJavascript(
+                    // vue-router 会在 history.state.position 里记当前位置；position <= 0 时
+                    // 说明已经在最早一条，history.back() 不会生效，直接按「退无可退」处理。
+                    // 没有该字段的站点退化为 history.length 判断。
+                    // 返回格式（便于调试日志）：可否后退(1/0)|history.length|position
+                    "(function(){try{"
+                            + "var len=window.history.length;"
+                            + "var s=window.history.state;"
+                            + "var pos=(s&&typeof s.position==='number')?s.position:'na';"
+                            + "if(len<=1)return '0|'+len+'|'+pos;"
+                            + "if(typeof pos==='number'&&pos<=0)return '0|'+len+'|'+pos;"
+                            + "window.history.back();return '1|'+len+'|'+pos;"
+                            + "}catch(e){}return '0|?|?';})()",
+                    value -> {
+                        String probe = value == null ? "" : value.replace("\"", "").trim();
+                        boolean hasHistory = probe.startsWith("1");
+                        if (DEBUG_ENABLED) {
+                            Log.i(TAG, "back probe: " + probe
+                                    + " [canBack|historyLength|position]");
+                        }
+                        if (!hasHistory) {
+                            // 网页自己也认为没有更早的历史，立即按退无可退处理（双击退出仍然跟手）
+                            mBackProbeRunning = false;
+                            _onNoWebHistoryLeft();
+                            return;
+                        }
+                        mMainHandler.postDelayed(() -> {
+                            try {
+                                mBackProbeRunning = false;
+                                String current = mWebView == null ? null : mWebView.getUrl();
+                                if (current != null && !current.equals(url)) {
+                                    // 网页确实后退了（hash 路由 / pushState 历史）
+                                    if (DEBUG_ENABLED) {
+                                        Log.i(TAG, "back probe: web moved " + url + " -> " + current);
+                                    }
+                                    return;
+                                }
+                                if (DEBUG_ENABLED) {
+                                    Log.i(TAG, "back probe: url unchanged after history.back, url=" + url);
+                                }
+                                _onNoWebHistoryLeft();
+                            } catch (Exception e) {
+                                Log.w(TAG, "back probe check failed: " + e.getMessage());
+                            }
+                        }, 300L);
+                    });
+        } catch (Exception e) {
+            mBackProbeRunning = false;
+            Log.w(TAG, "back probe evaluate failed: " + e.getMessage());
+            return _handleBackExit();
+        }
+        return true;
+    }
+
+    /** 确认网页已经退无可退后的收尾：按配置吃掉、双击退出、或系统默认退出。 */
+    private void _onNoWebHistoryLeft() {
+        try {
+            if (!_handleBackExit()) {
+                // 等价于原先落到 super.onKeyDown 时的系统默认退出
+                finish();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "back exit failed: " + e.getMessage());
+        }
+    }
+
+    /** 网页已经退无可退：按开关吃掉返回键，或双击退出，或交给系统默认行为。 */
+    private boolean _handleBackExit() {
+        if (DEBUG_ENABLED) {
+            long sinceLast = mLastBackPressedAt == 0L ? -1L : System.currentTimeMillis() - mLastBackPressedAt;
+            Log.i(TAG, "back exit: disableBackExit=" + DISABLE_BACK_EXIT
+                    + " exitOnBack=" + EXIT_ON_BACK
+                    + " sinceLastPress=" + (sinceLast < 0 ? "never" : sinceLast + "ms"));
+        }
+        if (DISABLE_BACK_EXIT) {
+            // 已经无处可退，按配置把返回键吃掉
+            return true;
+        }
+        if (EXIT_ON_BACK && mWebView != null) {
+            long now = System.currentTimeMillis();
+            if (now - mLastBackPressedAt < 2000L) {
+                finish();
+                return true;
+            }
+            mLastBackPressedAt = now;
+            Toast.makeText(this, "再按一次退出", Toast.LENGTH_SHORT).show();
+            return true;
+        }
+        return false;
     }
 
     /**

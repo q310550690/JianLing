@@ -113,6 +113,10 @@ pub struct AndroidProfile {
     pub exit_on_back_pressed: bool,
     /// 禁止返回键退出应用（网页退不了时返回键无效）
     pub disable_back_exit: bool,
+    /// 返回键策略：auto（原生历史优先，退不了再让网页后退一次）|
+    /// web（只走网页 history.back()）| exit（不后退，直接按退出处理）|
+    /// none（返回键被吃掉，无任何反应）
+    pub back_mode: String,
     /// 顶部加载进度条
     pub progress_bar: bool,
     pub progress_color: String,
@@ -178,6 +182,7 @@ impl Default for AndroidProfile {
             pull_to_refresh: false,
             exit_on_back_pressed: true,
             disable_back_exit: false,
+            back_mode: "auto".to_string(),
             progress_bar: false,
             progress_color: "#2E7D32".to_string(),
             progress_height: 1,

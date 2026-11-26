@@ -114,6 +114,8 @@ export interface AndroidProfile {
   exitOnBackPressed: boolean;
   /** 禁止返回键退出应用：网页退不了时返回键无效，应用不退出 */
   disableBackExit: boolean;
+  /** 返回键策略：auto 自动 | web 仅网页后退 | exit 仅退出 | none 不响应返回键 */
+  backMode: "auto" | "web" | "exit" | "none";
   /** 顶部加载进度条 */
   progressBar: boolean;
   progressColor: string;
@@ -462,6 +464,7 @@ export const DEFAULT_ANDROID: AndroidProfile = {
   pullToRefresh: false,
   exitOnBackPressed: true,
   disableBackExit: false,
+  backMode: "auto",
   progressBar: false,
   progressColor: "#2E7D32",
   progressHeight: 1,
