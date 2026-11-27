@@ -64,10 +64,11 @@ jobs:
           } else {
             # README 不维护更新日志，按上个 tag 到本次 tag 的提交标题生成
             $prev = git describe --tags --abbrev=0 "${tag}^" 2>$null
+            $skip = '^- chore\(release\)'
             if ($prev) {
-              $body = @("# $tag", "") + (& git log --no-merges --pretty=format:'- %s' "$prev..$tag")
+              $body = @("# $tag", "") + (& git log --no-merges --pretty=format:'- %s' "$prev..$tag" | Where-Object { $_ -notmatch $skip })
             } else {
-              $body = @("# $tag", "") + (& git log --no-merges --max-count=30 --pretty=format:'- %s' $tag)
+              $body = @("# $tag", "") + (& git log --no-merges --max-count=30 --pretty=format:'- %s' $tag | Where-Object { $_ -notmatch $skip })
             }
           }
           $target = Join-Path $PWD 'release-notes.md'
