@@ -41,6 +41,8 @@
     "resources": [
       "resources/android-template",
       "resources/debug-inject",
+      "resources/harmony-template",
+      "resources/ios-template",
       "binaries/shell-host.exe"
     ],
     "icon": [

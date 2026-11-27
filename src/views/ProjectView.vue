@@ -11,9 +11,14 @@ import {
   adbDevices,
   adbInstallApk,
   buildAndroid,
+  buildHarmony,
+  buildIos,
+  buildLinux,
+  buildMacos,
   buildWindows,
   DEFAULT_ANDROID,
   DEFAULT_LOCAL_SERVER,
+  DEFAULT_MACOS,
   DEFAULT_PERMISSION_PROMPTS,
   DEFAULT_PROXY_RULE,
   DEFAULT_SPLASH,
@@ -21,10 +26,13 @@ import {
   DEFAULT_WINDOWS_PERMISSIONS,
   newProject,
   normalizeBasePath,
+  isDebugApkPath,
   loadSettings,
   proxyHeadersError,
   readBuildLog,
   saveSettings,
+  trafficLogDir,
+  deleteBuildFiles,
 } from "../api";
 import type {
   AdbDevice,
@@ -48,8 +56,12 @@ function goBack() {
 }
 
 /** 设备调试页：不需要先打调试包，正式包开了 WebView 调试也能连 */
-function openDebugPage() {
-  router.push({ name: "project-debug", params: { id: props.projectId } });
+function openDebugPage(target?: "release" | "debug") {
+  router.push({
+    name: "project-debug",
+    params: { id: props.projectId },
+    query: target ? { target } : undefined,
+  });
 }
 
 const resetScroll = inject<() => void>("resetScroll", () => {});
@@ -271,6 +283,12 @@ const winForm = ref<WinFormState>({
   kernelId: null,
 });
 
+/** macOS 专属：Bundle ID 与 codesign 签名身份 */
+const macosForm = ref({
+  bundleId: DEFAULT_MACOS.bundleId,
+  signIdentity: DEFAULT_MACOS.signIdentity,
+});
+
 function addProxyRule() {
   winForm.value.localServer.proxies.push({ ...DEFAULT_PROXY_RULE, prefix: "", target: "" });
 }
@@ -299,7 +317,7 @@ const previewStatusStyle = computed(() => {
   return { background: "repeating-linear-gradient(45deg, #d6dfea 0 4px, #e7ecf3 4px 8px)" };
 });
 
-const activeTab = ref<"android" | "windows">("android");
+const activeTab = ref<"android" | "windows" | "macos" | "linux" | "harmony" | "ios">("android");
 
 /** Android 配置分组：把长表单拆成 6 段，避免整页上下翻 */
 type AndroidPane = "app" | "ui" | "behavior" | "permission" | "sign" | "build";
@@ -406,15 +424,17 @@ const statusText = computed(() => {
 const sdkReady = computed(() => Boolean(settings.value?.sdkPath));
 const builds = computed(() => project.value?.builds ?? []);
 const androidBuilds = computed(() =>
-  builds.value.filter((item) => (item.platform ?? "android") !== "windows"),
+  builds.value.filter((item) => (item.platform ?? "android") === "android"),
 );
 const windowsBuilds = computed(() =>
-  builds.value.filter((item) => item.platform === "windows"),
+  builds.value.filter((item) => (item.platform ?? "android") !== "android"),
 );
 
 /** 构建历史分段：调试包 / 正式包 */
 const historyKind = ref<"release" | "debug">("release");
-const isDebugApk = (item: BuildRecord) => item.apkPath.endsWith("-debug.apk");
+const isDebugApk = (item: BuildRecord) => isDebugApkPath(item.apkPath);
+/** 构建产物的文件名（构建历史第一行展示） */
+const fileName = (path: string) => path.split(/[\\/]/).pop() ?? path;
 const androidReleaseBuilds = computed(() => androidBuilds.value.filter((i) => !isDebugApk(i)));
 const androidDebugBuilds = computed(() => androidBuilds.value.filter(isDebugApk));
 const visibleAndroidBuilds = computed(() =>
@@ -472,6 +492,65 @@ async function appendBuild(record: BuildRecord) {
   await saveSettings(next);
   settings.value = next;
   project.value = updated;
+}
+
+/** 删除一条构建记录（可勾选同时删除磁盘产物） */
+const deleteOpen = ref(false);
+const deleteTarget = ref<BuildRecord | null>(null);
+const deleteWithFiles = ref(true);
+const deletingBuild = ref(false);
+
+/** 记录关联的磁盘文件：产物（Windows 可能多形态）+ 本次构建日志 */
+function buildArtifacts(item: BuildRecord): string[] {
+  // .app 是目录，iOS / 鸿蒙的 apkPath 也是工程目录，delete_build_files 只删文件，这里跳过（保留手动清理）
+  const dirPlatform = item.platform === "harmony" || item.platform === "ios";
+  const all = [
+    ...(item.artifacts ?? []),
+    dirPlatform ? "" : item.apkPath,
+    item.logPath,
+  ].filter((path) => !!path && !path.toLowerCase().endsWith(".app"));
+  return [...new Set(all)];
+}
+
+const deleteArtifacts = computed(() =>
+  deleteTarget.value ? buildArtifacts(deleteTarget.value) : [],
+);
+
+function askRemoveBuild(item: BuildRecord) {
+  deleteTarget.value = item;
+  deleteWithFiles.value = true;
+  deleteOpen.value = true;
+}
+
+async function confirmRemoveBuild() {
+  const item = deleteTarget.value;
+  const current = settings.value;
+  const base = project.value;
+  if (!item || !current || !base) return;
+  deletingBuild.value = true;
+  try {
+    if (deleteWithFiles.value) {
+      await deleteBuildFiles(buildArtifacts(item));
+    }
+    const updated: Project = {
+      ...base,
+      builds: base.builds.filter((b) => b.id !== item.id),
+    };
+    const next: Settings = {
+      ...current,
+      projects: current.projects.map((p) => (p.id === updated.id ? updated : p)),
+    };
+    await saveSettings(next);
+    settings.value = next;
+    project.value = updated;
+    deleteOpen.value = false;
+    deleteTarget.value = null;
+    ElMessage.success(deleteWithFiles.value ? "构建记录与文件已删除" : "构建记录已删除");
+  } catch (e) {
+    ElMessage.error(String(e));
+  } finally {
+    deletingBuild.value = false;
+  }
 }
 
 function formatTime(ts: number) {
@@ -559,6 +638,7 @@ function fillForm(source: Project) {
       enabled: a.localServer?.enabled ?? DEFAULT_LOCAL_SERVER.enabled,
       port: a.localServer?.port ?? DEFAULT_LOCAL_SERVER.port,
       basePath: a.localServer?.basePath ?? DEFAULT_LOCAL_SERVER.basePath,
+      debugLog: a.localServer?.debugLog ?? DEFAULT_LOCAL_SERVER.debugLog,
       proxies: (a.localServer?.proxies ?? DEFAULT_LOCAL_SERVER.proxies).map((r) => ({
         ...DEFAULT_PROXY_RULE,
         ...r,
@@ -601,7 +681,7 @@ function fillForm(source: Project) {
     closeMode: w.closeMode ?? DEFAULT_WINDOWS.closeMode,
     zoom: w.zoom || DEFAULT_WINDOWS.zoom,
     autoplay: w.autoplay ?? DEFAULT_WINDOWS.autoplay,
-    blockContextMenu: w.blockContextMenu ?? false,
+    blockContextMenu: w.blockContextMenu ?? DEFAULT_WINDOWS.blockContextMenu,
     blockTextSelect: w.blockTextSelect ?? false,
     hideScrollbars: w.hideScrollbars ?? DEFAULT_WINDOWS.hideScrollbars,
     blockCtrlZoom: w.blockCtrlZoom ?? false,
@@ -623,6 +703,7 @@ function fillForm(source: Project) {
       enabled: w.localServer?.enabled ?? DEFAULT_LOCAL_SERVER.enabled,
       port: w.localServer?.port ?? DEFAULT_LOCAL_SERVER.port,
       basePath: w.localServer?.basePath ?? DEFAULT_LOCAL_SERVER.basePath,
+      debugLog: w.localServer?.debugLog ?? DEFAULT_LOCAL_SERVER.debugLog,
       proxies: (w.localServer?.proxies ?? DEFAULT_LOCAL_SERVER.proxies).map((r) => ({
         ...DEFAULT_PROXY_RULE,
         ...r,
@@ -644,6 +725,12 @@ function fillForm(source: Project) {
     certPath: w.certPath ?? null,
     certPassword: w.certPassword ?? "",
     kernelId: w.kernelId ?? null,
+  };
+
+  const macos = source.macos ?? DEFAULT_MACOS;
+  macosForm.value = {
+    bundleId: macos.bundleId ?? "",
+    signIdentity: macos.signIdentity ?? "",
   };
 }
 
@@ -736,6 +823,7 @@ async function persist(): Promise<Project> {
         enabled: form.value.localServer.enabled,
         port: form.value.localServer.port,
         basePath: normalizeBasePath(form.value.localServer.basePath),
+        debugLog: form.value.localServer.debugLog,
         proxies: form.value.localServer.proxies.map((r) => ({ ...r })),
       },
       splash: { ...form.value.splash },
@@ -784,6 +872,7 @@ async function persist(): Promise<Project> {
         enabled: winForm.value.localServer.enabled,
         port: winForm.value.localServer.port,
         basePath: normalizeBasePath(winForm.value.localServer.basePath),
+        debugLog: winForm.value.localServer.debugLog,
         proxies: winForm.value.localServer.proxies.map((r) => ({ ...r })),
       },
       splash: { ...winForm.value.splash },
@@ -795,6 +884,10 @@ async function persist(): Promise<Project> {
       certPath: (winForm.value.certPath ?? "").trim() || null,
       certPassword: winForm.value.certPassword.trim() || null,
       kernelId: winForm.value.kernelId ?? null,
+    },
+    macos: {
+      bundleId: macosForm.value.bundleId.trim(),
+      signIdentity: macosForm.value.signIdentity.trim(),
     },
   };
   const list = current.projects.some((p) => p.id === updated.id)
@@ -1031,8 +1124,8 @@ async function startBuild(debugBuild = false) {
     }
     ElMessage.success("构建完成");
     if (debugBuild) {
-      // 调试包的下一步就是装到设备上看日志，直接进调试页
-      router.push({ name: "project-debug", params: { id: props.projectId } });
+      // 调试包的下一步就是装到设备上看日志，直接进调试页并选中调试包
+      openDebugPage("debug");
     }
   } catch (e) {
     const message = String(e);
@@ -1136,6 +1229,7 @@ async function startWindowsBuild() {
       projectId: props.projectId,
       appName: saved.android.appName,
       versionName: saved.android.versionName,
+      packageName: saved.android.packageName,
       outputDir: saved.outputDir ?? null,
       sourceKind: winForm.value.sourceKind,
       startUrl: winForm.value.startUrl.trim(),
@@ -1180,6 +1274,7 @@ async function startWindowsBuild() {
         enabled: winForm.value.localServer.enabled,
         port: winForm.value.localServer.port,
         basePath: normalizeBasePath(winForm.value.localServer.basePath),
+        debugLog: winForm.value.localServer.debugLog,
         proxies: winForm.value.localServer.proxies.map((r) => ({ ...r })),
       },
       splash: { ...winForm.value.splash },
@@ -1209,6 +1304,9 @@ async function startWindowsBuild() {
       platform: "windows",
       failed: false,
       error: "",
+      artifacts: [built.singleExe, built.installer, built.portableZip].filter(
+        (path): path is string => !!path,
+      ),
     });
     const deliver = [
       built.singleExe ? "单文件 exe" : null,
@@ -1242,6 +1340,496 @@ async function startWindowsBuild() {
   }
 }
 
+async function startMacosBuild() {
+  if (exporting.value) return;
+  if (!outputDir.value.trim()) {
+    ElMessage.error("请先选择产物输出目录再构建");
+    return;
+  }
+  const headersError = firstProxyHeadersError(winForm.value.localServer.proxies);
+  if (headersError) {
+    ElMessage.error(headersError);
+    return;
+  }
+  exporting.value = true;
+  winResult.value = null;
+  winLogs.value = [];
+  winBuildError.value = "";
+  activeTab.value = "macos";
+  winTab.value = "build";
+  const startedAt = Date.now();
+  try {
+    const saved = await persist();
+    const built = await buildMacos({
+      projectId: props.projectId,
+      appName: saved.android.appName,
+      versionName: saved.android.versionName,
+      packageName: saved.android.packageName,
+      outputDir: saved.outputDir ?? null,
+      sourceKind: winForm.value.sourceKind,
+      startUrl: winForm.value.startUrl.trim(),
+      startQuery: winForm.value.startQuery.trim(),
+      localDir: winForm.value.localDir.trim() || null,
+      iconPath: saved.android.iconPath ?? null,
+      sizeMode: winForm.value.sizeMode,
+      width: winForm.value.width,
+      height: winForm.value.height,
+      aspectW: winForm.value.aspectW,
+      aspectH: winForm.value.aspectH,
+      resizable: winForm.value.resizable,
+      frameless: winForm.value.frameless,
+      alwaysOnTop: winForm.value.alwaysOnTop,
+      maximized: winForm.value.maximized,
+      debugEnabled: winForm.value.debugEnabled,
+      singleInstance: winForm.value.singleInstance,
+      autoStart: winForm.value.autoStart,
+      minimizeOnClose: winForm.value.closeMode === "minimize",
+      closeMode: winForm.value.closeMode,
+      zoom: winForm.value.zoom,
+      autoplay: winForm.value.autoplay,
+      blockContextMenu: winForm.value.blockContextMenu,
+      blockTextSelect: winForm.value.blockTextSelect,
+      hideScrollbars: winForm.value.hideScrollbars,
+      blockCtrlZoom: winForm.value.blockCtrlZoom,
+      blockBrowserKeys: winForm.value.blockBrowserKeys,
+      externalLinksInBrowser: winForm.value.externalLinksInBrowser,
+      minFontSize: winForm.value.minFontSize,
+      ignoreCertErrors: winForm.value.ignoreCertErrors,
+      progressBar: winForm.value.progressBar,
+      navBar: winForm.value.navBar,
+      progressColor: winForm.value.progressColor,
+      progressHeight: winForm.value.progressHeight,
+      uaMode: winForm.value.uaMode,
+      userAgent: winForm.value.userAgent.trim(),
+      downloadToSubfolder: winForm.value.downloadToSubfolder,
+      minWidth: winForm.value.minWidth,
+      minHeight: winForm.value.minHeight,
+      rememberWindow: winForm.value.rememberWindow,
+      localServer: {
+        enabled: winForm.value.localServer.enabled,
+        port: winForm.value.localServer.port,
+        basePath: normalizeBasePath(winForm.value.localServer.basePath),
+        debugLog: winForm.value.localServer.debugLog,
+        proxies: winForm.value.localServer.proxies.map((r) => ({ ...r })),
+      },
+      splash: { ...winForm.value.splash },
+      permissions: { ...winForm.value.permissions },
+      outputSingle: winForm.value.outputSingle,
+      outputInstaller: winForm.value.outputInstaller,
+      outputPortable: winForm.value.outputPortable,
+      installScope: winForm.value.installScope,
+      certPath: (winForm.value.certPath ?? "").trim() || null,
+      certPassword: winForm.value.certPassword.trim() || null,
+      kernelPath: null,
+      bundleId: macosForm.value.bundleId.trim() || null,
+      signIdentity: macosForm.value.signIdentity.trim() || null,
+    });
+    await appendBuild({
+      id: `b${Date.now().toString(36)}`,
+      buildId: built.buildId,
+      apkPath: built.appPath,
+      sizeBytes: built.sizeBytes,
+      signed: built.signed,
+      versionName: saved.android.versionName,
+      versionCode: saved.android.versionCode,
+      durationSecs: built.durationSecs,
+      createdAt: Date.now(),
+      logPath: built.logPath,
+      platform: "macos",
+      failed: false,
+      error: "",
+      artifacts: [built.zipPath].filter((path): path is string => !!path),
+    });
+    ElMessage.success(`macOS 已导出：${built.appPath}`);
+    await reveal(built.dir);
+  } catch (e) {
+    const message = String(e);
+    winBuildError.value = message;
+    ElMessage.error(message);
+    await appendBuild({
+      id: `b${Date.now().toString(36)}`,
+      apkPath: "",
+      sizeBytes: 0,
+      signed: false,
+      versionName: form.value.versionName,
+      versionCode: form.value.versionCode,
+      durationSecs: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+      createdAt: Date.now(),
+      logPath: logPathFromError(message),
+      platform: "macos",
+      failed: true,
+      error: message,
+    });
+  } finally {
+    exporting.value = false;
+  }
+}
+
+async function startLinuxBuild() {
+  if (exporting.value) return;
+  if (!outputDir.value.trim()) {
+    ElMessage.error("请先选择产物输出目录再构建");
+    return;
+  }
+  const headersError = firstProxyHeadersError(winForm.value.localServer.proxies);
+  if (headersError) {
+    ElMessage.error(headersError);
+    return;
+  }
+  exporting.value = true;
+  winResult.value = null;
+  winLogs.value = [];
+  winBuildError.value = "";
+  activeTab.value = "linux";
+  winTab.value = "build";
+  const startedAt = Date.now();
+  try {
+    const saved = await persist();
+    const built = await buildLinux({
+      projectId: props.projectId,
+      appName: saved.android.appName,
+      versionName: saved.android.versionName,
+      packageName: saved.android.packageName,
+      outputDir: saved.outputDir ?? null,
+      sourceKind: winForm.value.sourceKind,
+      startUrl: winForm.value.startUrl.trim(),
+      startQuery: winForm.value.startQuery.trim(),
+      localDir: winForm.value.localDir.trim() || null,
+      iconPath: saved.android.iconPath ?? null,
+      sizeMode: winForm.value.sizeMode,
+      width: winForm.value.width,
+      height: winForm.value.height,
+      aspectW: winForm.value.aspectW,
+      aspectH: winForm.value.aspectH,
+      resizable: winForm.value.resizable,
+      frameless: winForm.value.frameless,
+      alwaysOnTop: winForm.value.alwaysOnTop,
+      maximized: winForm.value.maximized,
+      debugEnabled: winForm.value.debugEnabled,
+      singleInstance: winForm.value.singleInstance,
+      autoStart: winForm.value.autoStart,
+      minimizeOnClose: winForm.value.closeMode === "minimize",
+      closeMode: winForm.value.closeMode,
+      zoom: winForm.value.zoom,
+      autoplay: winForm.value.autoplay,
+      blockContextMenu: winForm.value.blockContextMenu,
+      blockTextSelect: winForm.value.blockTextSelect,
+      hideScrollbars: winForm.value.hideScrollbars,
+      blockCtrlZoom: winForm.value.blockCtrlZoom,
+      blockBrowserKeys: winForm.value.blockBrowserKeys,
+      externalLinksInBrowser: winForm.value.externalLinksInBrowser,
+      minFontSize: winForm.value.minFontSize,
+      ignoreCertErrors: winForm.value.ignoreCertErrors,
+      progressBar: winForm.value.progressBar,
+      navBar: winForm.value.navBar,
+      progressColor: winForm.value.progressColor,
+      progressHeight: winForm.value.progressHeight,
+      uaMode: winForm.value.uaMode,
+      userAgent: winForm.value.userAgent.trim(),
+      downloadToSubfolder: winForm.value.downloadToSubfolder,
+      minWidth: winForm.value.minWidth,
+      minHeight: winForm.value.minHeight,
+      rememberWindow: winForm.value.rememberWindow,
+      localServer: {
+        enabled: winForm.value.localServer.enabled,
+        port: winForm.value.localServer.port,
+        basePath: normalizeBasePath(winForm.value.localServer.basePath),
+        debugLog: winForm.value.localServer.debugLog,
+        proxies: winForm.value.localServer.proxies.map((r) => ({ ...r })),
+      },
+      splash: { ...winForm.value.splash },
+      permissions: { ...winForm.value.permissions },
+      outputSingle: winForm.value.outputSingle,
+      outputInstaller: winForm.value.outputInstaller,
+      outputPortable: winForm.value.outputPortable,
+      installScope: winForm.value.installScope,
+      certPath: (winForm.value.certPath ?? "").trim() || null,
+      certPassword: winForm.value.certPassword.trim() || null,
+      kernelPath: null,
+    });
+    await appendBuild({
+      id: `b${Date.now().toString(36)}`,
+      buildId: built.buildId,
+      apkPath: built.exePath,
+      sizeBytes: built.sizeBytes,
+      signed: false,
+      versionName: saved.android.versionName,
+      versionCode: saved.android.versionCode,
+      durationSecs: built.durationSecs,
+      createdAt: Date.now(),
+      logPath: built.logPath,
+      platform: "linux",
+      failed: false,
+      error: "",
+      artifacts: [built.zipPath].filter((path): path is string => !!path),
+    });
+    ElMessage.success(`Linux 已导出：${built.exePath}`);
+    await reveal(built.dir);
+  } catch (e) {
+    const message = String(e);
+    winBuildError.value = message;
+    ElMessage.error(message);
+    await appendBuild({
+      id: `b${Date.now().toString(36)}`,
+      apkPath: "",
+      sizeBytes: 0,
+      signed: false,
+      versionName: form.value.versionName,
+      versionCode: form.value.versionCode,
+      durationSecs: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+      createdAt: Date.now(),
+      logPath: logPathFromError(message),
+      platform: "linux",
+      failed: true,
+      error: message,
+    });
+  } finally {
+    exporting.value = false;
+  }
+}
+
+async function startHarmonyBuild() {
+  if (exporting.value) return;
+  if (!outputDir.value.trim()) {
+    ElMessage.error("请先选择产物输出目录再构建");
+    return;
+  }
+  exporting.value = true;
+  winResult.value = null;
+  winLogs.value = [];
+  winBuildError.value = "";
+  activeTab.value = "harmony";
+  winTab.value = "build";
+  const startedAt = Date.now();
+  try {
+    const saved = await persist();
+    const built = await buildHarmony({
+      projectId: props.projectId,
+      appName: saved.android.appName,
+      versionName: saved.android.versionName,
+      packageName: saved.android.packageName,
+      outputDir: saved.outputDir ?? null,
+      sourceKind: winForm.value.sourceKind,
+      startUrl: winForm.value.startUrl.trim(),
+      startQuery: winForm.value.startQuery.trim(),
+      localDir: winForm.value.localDir.trim() || null,
+      iconPath: saved.android.iconPath ?? null,
+      sizeMode: winForm.value.sizeMode,
+      width: winForm.value.width,
+      height: winForm.value.height,
+      aspectW: winForm.value.aspectW,
+      aspectH: winForm.value.aspectH,
+      resizable: winForm.value.resizable,
+      frameless: winForm.value.frameless,
+      alwaysOnTop: winForm.value.alwaysOnTop,
+      maximized: winForm.value.maximized,
+      debugEnabled: winForm.value.debugEnabled,
+      singleInstance: winForm.value.singleInstance,
+      autoStart: winForm.value.autoStart,
+      minimizeOnClose: winForm.value.closeMode === "minimize",
+      closeMode: winForm.value.closeMode,
+      zoom: winForm.value.zoom,
+      autoplay: winForm.value.autoplay,
+      blockContextMenu: winForm.value.blockContextMenu,
+      blockTextSelect: winForm.value.blockTextSelect,
+      hideScrollbars: winForm.value.hideScrollbars,
+      blockCtrlZoom: winForm.value.blockCtrlZoom,
+      blockBrowserKeys: winForm.value.blockBrowserKeys,
+      externalLinksInBrowser: winForm.value.externalLinksInBrowser,
+      minFontSize: winForm.value.minFontSize,
+      ignoreCertErrors: winForm.value.ignoreCertErrors,
+      progressBar: winForm.value.progressBar,
+      navBar: winForm.value.navBar,
+      progressColor: winForm.value.progressColor,
+      progressHeight: winForm.value.progressHeight,
+      uaMode: winForm.value.uaMode,
+      userAgent: winForm.value.userAgent.trim(),
+      downloadToSubfolder: winForm.value.downloadToSubfolder,
+      minWidth: winForm.value.minWidth,
+      minHeight: winForm.value.minHeight,
+      rememberWindow: winForm.value.rememberWindow,
+      localServer: {
+        enabled: false,
+        port: 0,
+        basePath: "/",
+        debugLog: false,
+        proxies: [],
+      },
+      splash: { ...winForm.value.splash },
+      permissions: { ...winForm.value.permissions },
+      outputSingle: false,
+      outputInstaller: false,
+      outputPortable: false,
+      installScope: "user",
+      certPath: null,
+      certPassword: null,
+      kernelPath: null,
+    });
+    await appendBuild({
+      id: `b${Date.now().toString(36)}`,
+      buildId: built.buildId,
+      apkPath: built.projectPath,
+      sizeBytes: built.sizeBytes,
+      signed: false,
+      versionName: saved.android.versionName,
+      versionCode: saved.android.versionCode,
+      durationSecs: built.durationSecs,
+      createdAt: Date.now(),
+      logPath: built.logPath,
+      platform: "harmony",
+      failed: false,
+      error: "",
+      artifacts: [built.zipPath].filter((path): path is string => !!path),
+    });
+    ElMessage.success("鸿蒙工程已生成，用 DevEco Studio 打开后配置签名构建 HAP");
+    await reveal(built.dir);
+  } catch (e) {
+    const message = String(e);
+    winBuildError.value = message;
+    ElMessage.error(message);
+    await appendBuild({
+      id: `b${Date.now().toString(36)}`,
+      apkPath: "",
+      sizeBytes: 0,
+      signed: false,
+      versionName: form.value.versionName,
+      versionCode: form.value.versionCode,
+      durationSecs: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+      createdAt: Date.now(),
+      logPath: logPathFromError(message),
+      platform: "harmony",
+      failed: true,
+      error: message,
+    });
+  } finally {
+    exporting.value = false;
+  }
+}
+
+async function startIosBuild() {
+  if (exporting.value) return;
+  if (!outputDir.value.trim()) {
+    ElMessage.error("请先选择产物输出目录再构建");
+    return;
+  }
+  exporting.value = true;
+  winResult.value = null;
+  winLogs.value = [];
+  winBuildError.value = "";
+  activeTab.value = "ios";
+  winTab.value = "build";
+  const startedAt = Date.now();
+  try {
+    const saved = await persist();
+    const built = await buildIos({
+      projectId: props.projectId,
+      appName: saved.android.appName,
+      versionName: saved.android.versionName,
+      packageName: saved.android.packageName,
+      outputDir: saved.outputDir ?? null,
+      sourceKind: winForm.value.sourceKind,
+      startUrl: winForm.value.startUrl.trim(),
+      startQuery: winForm.value.startQuery.trim(),
+      localDir: winForm.value.localDir.trim() || null,
+      iconPath: saved.android.iconPath ?? null,
+      sizeMode: winForm.value.sizeMode,
+      width: winForm.value.width,
+      height: winForm.value.height,
+      aspectW: winForm.value.aspectW,
+      aspectH: winForm.value.aspectH,
+      resizable: winForm.value.resizable,
+      frameless: winForm.value.frameless,
+      alwaysOnTop: winForm.value.alwaysOnTop,
+      maximized: winForm.value.maximized,
+      debugEnabled: winForm.value.debugEnabled,
+      singleInstance: winForm.value.singleInstance,
+      autoStart: winForm.value.autoStart,
+      minimizeOnClose: winForm.value.closeMode === "minimize",
+      closeMode: winForm.value.closeMode,
+      zoom: winForm.value.zoom,
+      autoplay: winForm.value.autoplay,
+      blockContextMenu: winForm.value.blockContextMenu,
+      blockTextSelect: winForm.value.blockTextSelect,
+      hideScrollbars: winForm.value.hideScrollbars,
+      blockCtrlZoom: winForm.value.blockCtrlZoom,
+      blockBrowserKeys: winForm.value.blockBrowserKeys,
+      externalLinksInBrowser: winForm.value.externalLinksInBrowser,
+      minFontSize: winForm.value.minFontSize,
+      ignoreCertErrors: winForm.value.ignoreCertErrors,
+      progressBar: winForm.value.progressBar,
+      navBar: winForm.value.navBar,
+      progressColor: winForm.value.progressColor,
+      progressHeight: winForm.value.progressHeight,
+      uaMode: winForm.value.uaMode,
+      userAgent: winForm.value.userAgent.trim(),
+      downloadToSubfolder: winForm.value.downloadToSubfolder,
+      minWidth: winForm.value.minWidth,
+      minHeight: winForm.value.minHeight,
+      rememberWindow: winForm.value.rememberWindow,
+      localServer: {
+        enabled: false,
+        port: 0,
+        basePath: "/",
+        debugLog: false,
+        proxies: [],
+      },
+      splash: { ...winForm.value.splash },
+      permissions: { ...winForm.value.permissions },
+      outputSingle: false,
+      outputInstaller: false,
+      outputPortable: false,
+      installScope: "user",
+      certPath: null,
+      certPassword: null,
+      kernelPath: null,
+      bundleId: macosForm.value.bundleId.trim() || null,
+      signIdentity: null,
+    });
+    await appendBuild({
+      id: `b${Date.now().toString(36)}`,
+      buildId: built.buildId,
+      apkPath: built.projectPath,
+      sizeBytes: built.sizeBytes,
+      signed: false,
+      versionName: saved.android.versionName,
+      versionCode: saved.android.versionCode,
+      durationSecs: built.durationSecs,
+      createdAt: Date.now(),
+      logPath: built.logPath,
+      platform: "ios",
+      failed: false,
+      error: "",
+      artifacts: [built.zipPath].filter((path): path is string => !!path),
+    });
+    ElMessage.success(
+      built.xcodeproj
+        ? "iOS 工程已生成，用 Xcode 打开后配置签名导出 ipa"
+        : "iOS 工程已生成，用 Xcode 打开 project.yml 或新建工程导入 Sources/Resources"
+    );
+    await reveal(built.dir);
+  } catch (e) {
+    const message = String(e);
+    winBuildError.value = message;
+    ElMessage.error(message);
+    await appendBuild({
+      id: `b${Date.now().toString(36)}`,
+      apkPath: "",
+      sizeBytes: 0,
+      signed: false,
+      versionName: form.value.versionName,
+      versionCode: form.value.versionCode,
+      durationSecs: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
+      createdAt: Date.now(),
+      logPath: logPathFromError(message),
+      platform: "ios",
+      failed: true,
+      error: message,
+    });
+  } finally {
+    exporting.value = false;
+  }
+}
+
 function mb(bytes: number) {
   return (bytes / 1024 / 1024).toFixed(2);
 }
@@ -1249,6 +1837,15 @@ function mb(bytes: number) {
 async function reveal(path: string) {
   try {
     await revealItemInDir(path);
+  } catch (e) {
+    ElMessage.error(String(e));
+  }
+}
+
+/** 打开 Windows 壳运行时写下的调试流量日志目录 */
+async function openTrafficLogDir() {
+  try {
+    await revealItemInDir(await trafficLogDir());
   } catch (e) {
     ElMessage.error(String(e));
   }
@@ -1292,8 +1889,11 @@ watch(
     installMessage.value = "";
     devices.value = [];
     selectedDevice.value = "";
+    androidTab.value = "app";
+    historyKind.value = "release";
     passwords.value = { store: "", key: "" };
     load();
+    void resetScroll();
   },
 );
 
@@ -1379,8 +1979,45 @@ onUnmounted(() => {
         >
           {{ building ? "构建中…" : "构建 Android" }}
         </el-button>
-        <el-button v-else type="primary" :loading="exporting" @click="startWindowsBuild">
+        <el-button
+          v-if="activeTab === 'windows'"
+          type="primary"
+          :loading="exporting"
+          @click="startWindowsBuild"
+        >
           {{ exporting ? "构建中…" : "构建 Windows" }}
+        </el-button>
+        <el-button
+          v-if="activeTab === 'macos'"
+          type="primary"
+          :loading="exporting"
+          @click="startMacosBuild"
+        >
+          {{ exporting ? "构建中…" : "构建 macOS" }}
+        </el-button>
+        <el-button
+          v-if="activeTab === 'linux'"
+          type="primary"
+          :loading="exporting"
+          @click="startLinuxBuild"
+        >
+          {{ exporting ? "构建中…" : "构建 Linux" }}
+        </el-button>
+        <el-button
+          v-if="activeTab === 'harmony'"
+          type="primary"
+          :loading="exporting"
+          @click="startHarmonyBuild"
+        >
+          {{ exporting ? "生成中…" : "生成鸿蒙工程" }}
+        </el-button>
+        <el-button
+          v-if="activeTab === 'ios'"
+          type="primary"
+          :loading="exporting"
+          @click="startIosBuild"
+        >
+          {{ exporting ? "生成中…" : "生成 iOS 工程" }}
         </el-button>
       </div>
     </header>
@@ -1474,9 +2111,57 @@ onUnmounted(() => {
             <span class="seg-dot"></span>
             Windows
           </button>
+          <button
+            type="button"
+            class="seg-item"
+            :class="{ on: activeTab === 'macos' }"
+            @click="activeTab = 'macos'"
+          >
+            <span class="seg-dot"></span>
+            macOS
+          </button>
+          <button
+            type="button"
+            class="seg-item"
+            :class="{ on: activeTab === 'linux' }"
+            @click="activeTab = 'linux'"
+          >
+            <span class="seg-dot"></span>
+            Linux
+          </button>
+          <button
+            type="button"
+            class="seg-item"
+            :class="{ on: activeTab === 'harmony' }"
+            @click="activeTab = 'harmony'"
+          >
+            <span class="seg-dot"></span>
+            鸿蒙
+          </button>
+          <button
+            type="button"
+            class="seg-item"
+            :class="{ on: activeTab === 'ios' }"
+            @click="activeTab = 'ios'"
+          >
+            <span class="seg-dot"></span>
+            iOS
+          </button>
         </div>
         <span class="platform-hint">
-          {{ activeTab === "android" ? "Android 专用配置" : "Windows 专用配置" }}
+          {{
+            activeTab === "android"
+              ? "Android 专用配置"
+              : activeTab === "macos"
+                ? "macOS 专用配置（窗口与本地服务同 Windows）"
+                : activeTab === "linux"
+                  ? "Linux 专用配置（窗口与本地服务同 Windows）"
+                  : activeTab === "harmony"
+                    ? "鸿蒙专用配置"
+                    : activeTab === "ios"
+                      ? "iOS 专用配置"
+                      : "Windows 专用配置"
+          }}
         </span>
       </div>
 
@@ -1549,6 +2234,15 @@ onUnmounted(() => {
             </div>
           </div>
           <el-switch v-model="form.localServer.enabled" />
+        </div>
+        <div v-if="form.localServer.enabled" class="toggle">
+          <div class="toggle-text">
+            <div class="toggle-name">调试流量日志</div>
+            <div class="toggle-desc">
+              记录转发过程和音频，只对调试包生效
+            </div>
+          </div>
+          <el-switch v-model="form.localServer.debugLog" />
         </div>
         <label v-if="form.localServer.enabled" class="field">
           <span class="field-label">Base 地址</span>
@@ -2161,39 +2855,64 @@ onUnmounted(() => {
         }}
       </div>
 
-      <div v-else class="hist-list">
-        <div v-for="item in visibleAndroidBuilds" :key="item.id" class="hist-row" :class="{ 'hist-row-failed': item.failed }">
-          <span class="hist-time mono">{{ formatTime(item.createdAt) }}</span>
-          <span class="hist-ver mono">v{{ item.versionName }} ({{ item.versionCode }})</span>
-          <span class="hist-size mono">{{ item.failed ? "—" : mb(item.sizeBytes) + " MB" }}</span>
-          <span class="hist-flag" :class="item.failed ? 'bad' : item.signed ? 'ok' : 'warn'">
-            {{ item.failed ? "构建失败" : item.signed ? "正式签名" : "非正式签名" }}
-          </span>
-          <span v-if="item.failed" class="hist-path mono err" :title="item.error">{{ item.error }}</span>
-          <span v-else class="hist-path mono" :title="item.apkPath">{{ item.apkPath }}</span>
-          <el-button v-if="!item.failed" size="small" @click="reveal(item.apkPath)">打开</el-button>
-          <el-button v-if="!item.failed" size="small" @click="openInstall(item)">安装</el-button>
-          <el-button
-            v-if="!item.failed && item.apkPath.endsWith('-debug.apk')"
-            size="small"
-            type="primary"
-            @click="router.push({ name: 'project-debug', params: { id: projectId } })"
-          >
-            调试
-          </el-button>
-          <el-button size="small" :disabled="!item.logPath" @click="openBuildLog(item.logPath)">
-            查看日志
-          </el-button>
+      <div v-else class="hist-card-list">
+        <div
+          v-for="item in visibleAndroidBuilds"
+          :key="item.id"
+          class="hist-card"
+          :class="{ failed: item.failed }"
+        >
+          <div class="hist-card-main">
+            <div
+              v-if="!item.failed"
+              class="hist-card-file"
+              :title="item.apkPath"
+            >{{ fileName(item.apkPath) }}</div>
+            <div v-else class="hist-card-file err">构建失败</div>
+            <div class="hist-card-top">
+              <span class="hist-card-ver">v{{ item.versionName }} ({{ item.versionCode }})</span>
+              <span class="hist-flag" :class="item.failed ? 'bad' : item.signed ? 'ok' : 'warn'">
+                {{ item.failed ? "构建失败" : item.signed ? "正式签名" : "非正式签名" }}
+              </span>
+              <span v-if="!item.failed && isDebugApk(item)" class="hist-kind">调试包</span>
+            </div>
+            <div class="hist-card-meta">
+              <template v-if="!item.failed">{{ mb(item.sizeBytes) }} MB · </template>
+              耗时 {{ item.durationSecs }}s · {{ formatTime(item.createdAt) }}
+              <template v-if="item.buildId"> · 水印 {{ item.buildId }}</template>
+            </div>
+            <div
+              v-if="!item.failed"
+              class="hist-card-path mono"
+              :title="item.apkPath"
+            >
+              {{ item.apkPath }}
+            </div>
+            <div v-else class="hist-card-path mono err" :title="item.error">{{ item.error }}</div>
+          </div>
+          <div class="hist-card-actions">
+            <template v-if="!item.failed">
+              <el-button size="small" @click="reveal(item.apkPath)">打开</el-button>
+              <el-button size="small" type="primary" @click="openInstall(item)">安装</el-button>
+              <el-button v-if="isDebugApk(item)" size="small" @click="openDebugPage('debug')">
+                调试
+              </el-button>
+            </template>
+            <el-button size="small" :disabled="!item.logPath" @click="openBuildLog(item.logPath)">
+              日志
+            </el-button>
+            <el-button size="small" type="danger" @click="askRemoveBuild(item)">删除</el-button>
+          </div>
         </div>
       </div>
     </section>
       </div>
 
-      <div v-show="activeTab === 'windows'" class="pane-tabs-wrap">
+      <div v-show="activeTab !== 'android'" class="pane-tabs-wrap">
         <el-segmented v-model="winTab" block class="pane-seg" :options="winPaneOptions" />
       </div>
 
-      <div v-show="activeTab === 'windows'" class="platform-body">
+      <div v-show="activeTab !== 'android'" class="platform-body">
     <section v-show="winTab === 'app'" class="card">
       <div class="card-head">
         <span class="card-title">应用信息</span>
@@ -2254,6 +2973,22 @@ onUnmounted(() => {
             </div>
           </div>
           <el-switch v-model="winForm.localServer.enabled" />
+        </div>
+        <div v-if="winForm.localServer.enabled" class="toggle">
+          <div class="toggle-text">
+            <div class="toggle-name">调试流量日志</div>
+            <div class="toggle-desc">
+              把转发过程记录到系统临时目录的 jianling-logs，排查用，平时关着
+            </div>
+          </div>
+          <el-switch v-model="winForm.localServer.debugLog" />
+        </div>
+        <div
+          v-if="winForm.localServer.enabled && winForm.localServer.debugLog"
+          class="proxy-head"
+        >
+          <span class="field-note">日志由程序运行时写入，这里只打开本机目录。</span>
+          <el-button size="small" @click="openTrafficLogDir">打开日志目录</el-button>
         </div>
         <label v-if="winForm.localServer.enabled" class="field">
           <span class="field-label">Base 地址</span>
@@ -2378,7 +3113,7 @@ onUnmounted(() => {
       </p>
     </section>
 
-    <section v-show="winTab === 'app'" class="card">
+    <section v-show="winTab === 'app'" v-if="activeTab === 'windows'" class="card">
       <div class="card-head">
         <span class="card-title">运行时内核</span>
         <span class="card-hint">WebView2 固定版本运行时</span>
@@ -2824,9 +3559,11 @@ onUnmounted(() => {
     <section v-show="winTab === 'sign'" class="card">
       <div class="card-head">
         <span class="card-title">代码签名</span>
-        <span class="card-hint">可选，留空导出未签名程序</span>
+        <span class="card-hint">
+          {{ activeTab === "macos" ? "可选，留空输出未签名 .app" : "可选，留空导出未签名程序" }}
+        </span>
       </div>
-      <div class="fields">
+      <div v-if="activeTab === 'windows'" class="fields">
         <div class="field span-2">
           <span class="field-label">签名证书（.pfx / .p12）</span>
           <div class="input-row">
@@ -2843,13 +3580,34 @@ onUnmounted(() => {
           <el-input v-model="winForm.certPassword" type="password" show-password />
         </label>
       </div>
-      <p class="card-note">
+      <p v-if="activeTab === 'windows'" class="card-note">
         Windows 的签名不是 .jks，而是 Authenticode 证书（.pfx），需要用系统里的 signtool
         签名（Windows SDK 自带）。不签名也能运行，但会触发 SmartScreen 警告。
       </p>
+      <div v-else class="fields">
+        <label class="field span-2">
+          <span class="field-label">签名身份</span>
+          <el-input
+            v-model="macosForm.signIdentity"
+            placeholder="Developer ID Application: 名称 (TEAMID)，留空不签名"
+            clearable
+          />
+        </label>
+        <label class="field span-2">
+          <span class="field-label">Bundle Identifier（可选）</span>
+          <el-input
+            v-model="macosForm.bundleId"
+            placeholder="com.example.app，留空按包名生成"
+            clearable
+          />
+        </label>
+      </div>
+      <p v-if="activeTab === 'macos'" class="card-note">
+        签名和 .icns 图标转换都依赖 macOS 上的 codesign / iconutil；在 Windows 上构建会跳过，输出未签名 .app。
+      </p>
     </section>
 
-    <section v-show="winTab === 'build'" class="card">
+    <section v-show="winTab === 'build' && activeTab === 'windows'" class="card">
       <div class="card-head">
         <span class="card-title">产物</span>
         <span class="card-hint">勾选这次要打出的形态，可多选</span>
@@ -2896,6 +3654,70 @@ onUnmounted(() => {
       <p class="card-note">
         产物会写进项目的「产物输出目录」，中间目录用完即清理。
         {{ winForm.outputInstaller || winForm.outputSingle || winForm.outputPortable ? "" : "当前一个都没勾选，构建会被拦下。" }}
+      </p>
+    </section>
+
+    <section v-show="winTab === 'build' && activeTab === 'macos'" class="card">
+      <div class="card-head">
+        <span class="card-title">产物</span>
+        <span class="card-hint">.app 目录 + zip</span>
+      </div>
+      <p class="card-note">
+        产物是 <code>应用名.app</code> 加一个同名 zip，写进项目的「产物输出目录」。
+        窗口、启动屏、本地服务、权限这些配置与 Windows 共用。
+      </p>
+      <p class="card-note">
+        构建需要 <code>src-tauri/binaries/shell-host-macos</code>（在 macOS 上编译后放进去）；
+        签名和图标转换也依赖 macOS 工具，在 Windows 上只能产出未签名 .app。
+      </p>
+    </section>
+
+    <section v-show="winTab === 'build' && activeTab === 'linux'" class="card">
+      <div class="card-head">
+        <span class="card-title">产物</span>
+        <span class="card-hint">可执行文件 + 目录 + zip</span>
+      </div>
+      <p class="card-note">
+        产物是一个目录：可执行文件、www/、shell.json、run.sh 和 .desktop，外面再打一个 zip。
+        窗口、启动屏、本地服务、权限这些配置与 Windows 共用。
+      </p>
+      <p class="card-note">
+        构建需要 <code>src-tauri/binaries/shell-host-linux</code>（在 Linux 上编译后放进去）。
+        运行时依赖系统的 WebKitGTK，.desktop 里的路径按打包机写死，换机器后需要改。
+      </p>
+    </section>
+
+    <section v-show="winTab === 'build' && activeTab === 'harmony'" class="card">
+      <div class="card-head">
+        <span class="card-title">产物</span>
+        <span class="card-hint">DevEco Studio 工程 + zip</span>
+      </div>
+      <p class="card-note">
+        生成的是 HarmonyOS NEXT 的 ArkTS 工程（Stage 模型 + ArkWeb），里面带 AppScope、entry、
+        rawfile/www（本地包时）。产物目录和 zip 都写进「产物输出目录」。
+      </p>
+      <p class="card-note">
+        工程只用到内容来源、图标和权限；窗口、启动屏、本地服务转发在鸿蒙上不生效。
+        HAP 构建和签名要在 DevEco Studio 里做，命令行 hvigor 需要额外配置 SDK 与证书。
+      </p>
+    </section>
+
+    <section v-show="winTab === 'build' && activeTab === 'ios'" class="card">
+      <div class="card-head">
+        <span class="card-title">产物</span>
+        <span class="card-hint">Xcode 工程 + zip</span>
+      </div>
+      <p class="card-note">
+        生成的是 Swift + WKWebView 的工程：<code>project.yml</code>（XcodeGen 描述）、
+        <code>Sources</code>、<code>Resources/www</code>（本地包时）和图标。
+        本机装了 xcodegen 会顺手生成 <code>.xcodeproj</code>，否则在 macOS 上执行
+        <code>xcodegen generate</code>。
+      </p>
+      <p class="card-note">
+        工程只用到内容来源、图标和权限；窗口参数、启动屏、本地服务转发在 iOS 上不生效。
+        图标用基础信息里选的 png，建议 1024×1024，没有就用内置占位图。
+        Bundle Identifier 复用 macOS 标签页里的填写，留空时按应用名生成。
+        签名和 ipa 导出要在 macOS 上用 Xcode 完成。
       </p>
     </section>
 
@@ -2951,7 +3773,17 @@ onUnmounted(() => {
       </div>
 
       <p v-else-if="!exporting" class="build-hint">
-        点右上角「构建 Windows」按上面勾选的形态产出，过程日志在「构建日志」里查看。
+        {{
+          activeTab === "macos"
+            ? "点右上角「构建 macOS」生成 .app 与 zip，过程日志在「构建日志」里查看。"
+            : activeTab === "linux"
+              ? "点右上角「构建 Linux」生成目录与 zip，过程日志在「构建日志」里查看。"
+              : activeTab === "harmony"
+                ? "点右上角「生成鸿蒙工程」，用 DevEco Studio 打开后再构建 HAP。"
+                : activeTab === "ios"
+                  ? "点右上角「生成 iOS 工程」，用 Xcode 打开后配置签名导出 ipa。"
+                  : "点右上角「构建 Windows」按上面勾选的形态产出，过程日志在「构建日志」里查看。"
+        }}
       </p>
       <p v-else class="build-hint live">正在构建，日志实时输出到「构建日志」。</p>
     </section>
@@ -2963,13 +3795,17 @@ onUnmounted(() => {
       </div>
 
       <div v-if="!windowsBuilds.length" class="hist-empty">
-        还没有 Windows 构建记录，点右上角「构建 Windows」生成第一个版本。
+        还没有桌面构建记录，点右上角「构建 Windows」或「构建 macOS」生成第一个版本。
       </div>
 
       <div v-else class="hist-list">
         <div v-for="item in windowsBuilds" :key="item.id" class="hist-row" :class="{ 'hist-row-failed': item.failed }">
           <span class="hist-time mono">{{ formatTime(item.createdAt) }}</span>
           <span class="hist-ver mono">v{{ item.versionName }} ({{ item.versionCode }})</span>
+          <span v-if="item.platform === 'macos'" class="hist-kind">macOS</span>
+          <span v-if="item.platform === 'linux'" class="hist-kind">Linux</span>
+          <span v-if="item.platform === 'harmony'" class="hist-kind">鸿蒙</span>
+          <span v-if="item.platform === 'ios'" class="hist-kind">iOS</span>
           <span class="hist-size mono">{{ item.failed ? "—" : mb(item.sizeBytes) + " MB" }}</span>
           <span class="hist-flag" :class="item.failed ? 'bad' : item.signed ? 'ok' : 'warn'">
             {{ item.failed ? "构建失败" : item.signed ? "已签名" : "未签名" }}
@@ -2980,6 +3816,7 @@ onUnmounted(() => {
           <el-button size="small" :disabled="!item.logPath" @click="openBuildLog(item.logPath)">
             查看日志
           </el-button>
+          <el-button size="small" type="danger" @click="askRemoveBuild(item)">删除</el-button>
         </div>
       </div>
     </section>
@@ -3078,6 +3915,34 @@ onUnmounted(() => {
           @click="installToDevice"
         >
           {{ installing ? "安装中…" : "安装到设备" }}
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="deleteOpen"
+      title="删除构建记录"
+      width="min(560px, 92vw)"
+      align-center
+    >
+      <div v-if="deleteTarget" class="delete-build">
+        <p class="delete-build-line">
+          确定删除
+          <strong>v{{ deleteTarget.versionName }}（{{ formatTime(deleteTarget.createdAt) }}）</strong>
+          的构建记录？
+        </p>
+        <el-checkbox v-model="deleteWithFiles">
+          同时删除产物和构建日志（不可恢复）
+        </el-checkbox>
+        <div v-if="deleteWithFiles && deleteArtifacts.length" class="delete-build-paths mono">
+          <div v-for="path in deleteArtifacts" :key="path" :title="path">{{ path }}</div>
+        </div>
+        <p v-if="!deleteWithFiles" class="delete-build-note">只删记录，磁盘文件保留。</p>
+      </div>
+      <template #footer>
+        <el-button @click="deleteOpen = false">取消</el-button>
+        <el-button type="danger" :loading="deletingBuild" @click="confirmRemoveBuild">
+          删除
         </el-button>
       </template>
     </el-dialog>
@@ -3980,6 +4845,135 @@ h1 {
 
 .hist-path.err {
   color: var(--danger);
+}
+
+/* 构建历史：卡片列表，避免表格化信息过密 */
+.hist-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hist-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-input);
+}
+
+.hist-card.failed {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.hist-card-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.hist-card-file {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hist-card-file.err {
+  color: var(--danger);
+}
+
+.hist-card-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.hist-card-ver {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.hist-card-meta {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hist-card-meta.err {
+  color: var(--danger);
+  white-space: normal;
+  word-break: break-all;
+}
+
+.hist-kind {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--surface-sunken);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.hist-card-path {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hist-card-path.err {
+  color: var(--danger);
+  white-space: normal;
+  word-break: break-all;
+}
+
+.hist-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+/* 删除构建记录：确认框里的文件清单 */
+.delete-build-line {
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-primary);
+}
+
+.delete-build-paths {
+  margin-top: 8px;
+  padding: 8px 10px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-sunken);
+  font-size: 11px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.delete-build-paths > div + div {
+  margin-top: 3px;
+}
+
+.delete-build-note {
+  margin: 8px 0 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
 }
 
 /* 构建失败：卡片描边 + 标题红字 + 醒目的失败块 */

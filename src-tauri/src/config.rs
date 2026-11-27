@@ -267,6 +267,8 @@ pub struct LocalServerConfig {
     pub port: u16,
     /// 部署目录，形如 "/" 或 "/h5/"；静态文件按此前缀映射
     pub base_path: String,
+    /// 调试流量日志：只在调试包里生效，正式包一律不开启
+    pub debug_log: bool,
     pub proxies: Vec<ProxyRule>,
 }
 
@@ -276,6 +278,7 @@ impl Default for LocalServerConfig {
             enabled: false,
             port: 0,
             base_path: "/".to_string(),
+            debug_log: false,
             proxies: vec![ProxyRule {
                 prefix: "/api".to_string(),
                 target: String::new(),
@@ -435,7 +438,7 @@ impl Default for WindowsProfile {
             close_mode: "exit".to_string(),
             zoom: 1.0,
             autoplay: true,
-            block_context_menu: false,
+            block_context_menu: true,
             block_text_select: false,
             hide_scrollbars: true,
             block_ctrl_zoom: false,
@@ -498,9 +501,21 @@ pub struct Project {
     pub target: String,
     pub android: AndroidProfile,
     pub windows: WindowsProfile,
+    /// macOS 专属字段；窗口、本地服务等其余配置复用 windows
+    pub macos: MacosProfile,
     pub created_at: u64,
     pub updated_at: u64,
     pub builds: Vec<BuildRecord>,
+}
+
+/// macOS 桌面套壳的专属配置。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MacosProfile {
+    /// CFBundleIdentifier，留空时按包名或应用名生成
+    pub bundle_id: String,
+    /// codesign 签名身份，留空输出未签名 .app
+    pub sign_identity: String,
 }
 
 impl Default for Project {
@@ -512,6 +527,7 @@ impl Default for Project {
             target: "android".to_string(),
             android: AndroidProfile::default(),
             windows: WindowsProfile::default(),
+            macos: MacosProfile::default(),
             created_at: 0,
             updated_at: 0,
             builds: Vec::new(),
@@ -573,6 +589,47 @@ pub fn read_build_log(path: String) -> Result<String, String> {
     }
     let bytes = std::fs::read(&file).map_err(|e| format!("读取日志失败：{e}"))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Windows 壳运行时把调试流量日志写在系统临时目录，这里返回目录（必要时创建），
+/// 供「打开日志目录」按钮直接打开资源管理器。
+#[tauri::command]
+pub fn traffic_log_dir() -> Result<String, String> {
+    let dir = std::env::temp_dir().join("jianling-logs");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败：{e}"))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// 删除构建记录关联的产物文件。只删白名单扩展名的普通文件，
+/// 不存在的路径按已删除处理，避免用户手动清理过之后仍报错。
+#[tauri::command]
+pub fn delete_build_files(paths: Vec<String>) -> Result<Vec<String>, String> {
+    let mut removed = Vec::new();
+    for raw in paths {
+        let text = raw.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(text);
+        let ext = path
+            .extension()
+            .and_then(|v| v.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "apk" | "exe" | "zip" | "log") {
+            return Err(format!("拒绝删除非构建产物：{text}"));
+        }
+        let meta = match std::fs::metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            return Err(format!("拒绝删除非文件：{text}"));
+        }
+        std::fs::remove_file(&path).map_err(|e| format!("删除失败 {text}：{e}"))?;
+        removed.push(text.to_string());
+    }
+    Ok(removed)
 }
 
 #[tauri::command]

@@ -255,7 +255,7 @@ impl Default for ShellConfig {
             minimize_on_close: false,
             close_mode: String::new(),
             zoom: default_zoom(),
-            block_context_menu: false,
+            block_context_menu: true,
             block_text_select: false,
             hide_scrollbars: false,
             block_ctrl_zoom: false,
@@ -287,6 +287,21 @@ fn exe_dir() -> PathBuf {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 内容根目录：Windows/Linux 是 exe 同级；macOS 的 .app 里优先 Contents/Resources。
+fn content_base() -> PathBuf {
+    let exe = exe_dir();
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(contents) = exe.parent() {
+            let resources = contents.join("Resources");
+            if resources.join("shell.json").is_file() || resources.join("www").is_dir() {
+                return resources;
+            }
+        }
+    }
+    exe
 }
 
 fn load_config(dir: &std::path::Path) -> ShellConfig {
@@ -785,9 +800,17 @@ fn open_external(url: &str) {
             log_error(&format!("打开系统浏览器失败：{e}"));
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = url;
+        if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+            log_error(&format!("打开系统浏览器失败：{e}"));
+        }
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        if let Err(e) = std::process::Command::new("xdg-open").arg(url).spawn() {
+            log_error(&format!("打开系统浏览器失败：{e}"));
+        }
     }
 }
 
@@ -1062,9 +1085,37 @@ fn fit_ratio_to_screen(window: &tao::window::Window, width: f64, height: f64) {
     window.set_outer_position(tao::dpi::PhysicalPosition::new(x, y));
 }
 
-/// 窗口位置/尺寸记忆文件（放在 exe 同级，绿色版拷走也能带着）
+/// 窗口位置/尺寸记忆文件所在目录。
+/// Windows / 绿色版放在 exe 同级，拷走也能带着；macOS 的 .app 内部不可写，放用户目录。
+fn state_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("JianLing");
+            let _ = fs::create_dir_all(&dir);
+            return dir;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // AppImage 的挂载点是只读的，状态文件必须放用户目录
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("JianLing");
+            let _ = fs::create_dir_all(&dir);
+            return dir;
+        }
+    }
+    exe_dir()
+}
+
 fn window_state_path() -> PathBuf {
-    exe_dir().join("window.json")
+    state_dir().join("window.json")
 }
 
 fn load_window_state() -> Option<(i32, i32, u32, u32)> {
@@ -1115,7 +1166,10 @@ fn system_download_dir() -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 fn system_download_dir() -> Option<PathBuf> {
-    None
+    // macOS / Linux 默认都在 ~/Downloads；不存在时交给上层兜底
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let dir = home.join("Downloads");
+    dir.is_dir().then_some(dir)
 }
 
 /// 下载目录：开启「统一存到应用子目录」时落到「下载\<应用名>」，否则就用系统下载目录本身。
@@ -1124,6 +1178,7 @@ fn download_target(title: &str, to_subfolder: bool) -> Option<PathBuf> {
     let root = system_download_dir()
         .or_else(|| {
             std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
                 .map(PathBuf::from)
                 .map(|home| home.join("Downloads"))
         })
@@ -1145,7 +1200,7 @@ fn main() {
     // 单文件版：页面资源内嵌在 exe 尾部，先解到缓存目录再当普通目录用
     let content_base = embedded_payload()
         .and_then(|data| extract_payload(&data))
-        .unwrap_or_else(exe_dir);
+        .unwrap_or_else(content_base);
     let config = load_config(&content_base);
 
     // 自带内核：把 WebView2 固定版本运行时目录告诉内核加载器（必须在创建 WebView 之前）
@@ -1247,6 +1302,13 @@ fn main() {
                 "exit".to_string()
             }
         }
+    };
+    // 没有托盘实现的平台把「收进托盘」当成最小化，避免窗口隐藏后找不回来
+    #[cfg(not(windows))]
+    let close_mode = if close_mode == "tray" {
+        "minimize".to_string()
+    } else {
+        close_mode
     };
 
     #[cfg(windows)]

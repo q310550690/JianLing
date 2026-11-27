@@ -24,7 +24,7 @@ export const router = createRouter({
           name: "project",
           component: ProjectView,
           props: (route) => ({ projectId: String(route.params.id ?? "") }),
-          meta: { title: "套壳配置" },
+          meta: { title: "套壳配置", keepAlive: true },
         },
         {
           path: "projects/:id/debug",

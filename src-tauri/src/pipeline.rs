@@ -597,7 +597,13 @@ fn write_android_splash(
 }
 
 /// 写入本地服务配置，供 MainActivity 里的 LocalServer 在运行时读取。
-fn write_android_local_server(work_dir: &Path, cfg: &crate::config::LocalServerConfig) -> Result<(), String> {
+///
+/// `debug_log` 为 true 时（调试包）壳侧会把转发流量与上行音频落到应用外部目录，便于排查。
+fn write_android_local_server(
+    work_dir: &Path,
+    cfg: &crate::config::LocalServerConfig,
+    debug_log: bool,
+) -> Result<(), String> {
     let proxies: Vec<serde_json::Value> = cfg
         .proxies
         .iter()
@@ -617,6 +623,7 @@ fn write_android_local_server(work_dir: &Path, cfg: &crate::config::LocalServerC
         "enabled": cfg.enabled,
         "port": cfg.port,
         "basePath": crate::config::normalize_base_path(&cfg.base_path),
+        "debugLog": debug_log,
         "proxies": proxies
     });
     let raw = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
@@ -878,6 +885,28 @@ fn android_orientation(value: &str) -> String {
         "portrait" => "portrait".to_string(),
         _ => "unspecified".to_string(),
     }
+}
+
+/// 本地时间戳（yyyyMMdd-HHmmss-SSS），用于产物文件名，精确到毫秒避免同秒覆盖
+#[cfg(target_os = "windows")]
+fn local_timestamp() -> String {
+    unsafe {
+        let mut st: windows_sys::Win32::Foundation::SYSTEMTIME = std::mem::zeroed();
+        windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut st);
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+        )
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        .to_string()
 }
 
 fn sanitize_filename(input: &str) -> String {
@@ -1143,11 +1172,14 @@ pub fn run_build(app: &AppHandle, req: AndroidBuildRequest) -> Result<BuildResul
         .iter()
         .filter(|r| !r.prefix.trim().is_empty() && !r.target.trim().is_empty())
         .count();
+    // 产物命名：应用名称-版本-包名-[debug-]时间戳.apk（包名用基础包名，调试包的 .debug 不重复写）
     let output_name = format!(
-        "{}-{}{}.apk",
+        "{}-{}-{}-{}{}.apk",
         sanitize_filename(&app_name),
         sanitize_filename(&req.version_name),
-        if debug_build { "-debug" } else { "" }
+        sanitize_filename(&base_package),
+        if debug_build { "debug-" } else { "" },
+        local_timestamp()
     );
     let build_meta = crate::watermark::BuildMeta::new(
         build_id.clone(),
@@ -1169,7 +1201,7 @@ pub fn run_build(app: &AppHandle, req: AndroidBuildRequest) -> Result<BuildResul
             .filter(|s| !s.is_empty())
             .ok_or("已选择本地静态包模式，但未指定 H5 目录或 zip")?;
         install_local_content(&work_dir, Path::new(source))?;
-        write_android_local_server(&work_dir, &req.local_server)?;
+        write_android_local_server(&work_dir, &req.local_server, debug_build && req.local_server.debug_log)?;
         if req.local_server.enabled {
             let count = req
                 .local_server
@@ -1660,13 +1692,7 @@ pub fn run_build(app: &AppHandle, req: AndroidBuildRequest) -> Result<BuildResul
         .unwrap_or_else(|| work_dir.clone());
     std::fs::create_dir_all(&output_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
 
-    let file_name = format!(
-        "{}-{}{}.apk",
-        sanitize_filename(&app_name),
-        sanitize_filename(&req.version_name),
-        if debug_build { "-debug" } else { "" }
-    );
-    let target = output_dir.join(file_name);
+    let target = output_dir.join(&output_name);
     std::fs::copy(&apk, &target).map_err(|e| format!("复制产物失败: {e}"))?;
 
     let size_bytes = std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0);
@@ -1734,6 +1760,9 @@ pub struct WindowsBuildRequest {
     #[serde(default)]
     pub project_id: String,
     pub version_name: String,
+    /// 包名（仅用于产物命名，留空时退回应用名）
+    #[serde(default)]
+    pub package_name: String,
     /// 产物输出目录（项目级，必填）
     pub output_dir: Option<String>,
     pub source_kind: String,
@@ -1811,6 +1840,12 @@ pub struct WindowsBuildRequest {
     pub kernel_path: Option<String>,
     pub cert_path: Option<String>,
     pub cert_password: Option<String>,
+    /// macOS 专用：Bundle Identifier（留空时用包名或应用名生成）
+    #[serde(default)]
+    pub bundle_id: Option<String>,
+    /// macOS 专用：codesign 签名身份（如 "Developer ID Application: Xxx (TEAMID)"，留空不签名）
+    #[serde(default)]
+    pub sign_identity: Option<String>,
 }
 
 fn shell_host_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2158,6 +2193,12 @@ fn run_build_windows(
     );
     let base_name = sanitize_filename(&request.app_name).replace(' ', "_");
     let version = sanitize_filename(request.version_name.trim()).replace(' ', "_");
+    // 产物命名：应用名称-版本-包名-时间戳，包名缺省时退回应用名
+    let pkg_name = sanitize_filename(if request.package_name.trim().is_empty() {
+        request.app_name.trim()
+    } else {
+        request.package_name.trim()
+    });
     let win_proxy_count = request
         .local_server
         .proxies
@@ -2410,6 +2451,7 @@ fn run_build_windows(
             "enabled": request.local_server.enabled,
             "port": request.local_server.port,
             "basePath": crate::config::normalize_base_path(&request.local_server.base_path),
+            "debugLog": request.local_server.debug_log,
             "proxies": proxies
         },
         "splash": {
@@ -2459,7 +2501,7 @@ fn run_build_windows(
         push(app, "info", "未配置签名证书，输出未签名程序".to_string());
     }
     // 按勾选产出：安装包 / 绿色版 zip / 单文件 exe
-    let stem = format!("{base_name}-{version}");
+    let stem = format!("{base_name}-{version}-{pkg_name}-{}", local_timestamp());
     let mut single_exe: Option<String> = None;
     let mut installer: Option<String> = None;
     let mut portable_zip: Option<String> = None;
@@ -2511,7 +2553,7 @@ fn run_build_windows(
     }
 
     if request.output_single {
-        let single_dest = out_root.join(format!("{stem}-single.exe"));
+        let single_dest = out_root.join(format!("{stem}.exe"));
         let payload_tmp = dir.join("payload.zip");
         let single_result = zip_directory(&dir, &payload_tmp, false)
             .and_then(|_| write_single_exe(&exe_dst, &payload_tmp, &single_dest));
@@ -2569,6 +2611,1599 @@ pub async fn build_windows(
     request: WindowsBuildRequest,
 ) -> Result<WindowsBuildResult, String> {
     tauri::async_runtime::spawn_blocking(move || run_build_windows(&app, request))
+        .await
+        .map_err(|e| format!("构建线程异常: {e}"))?
+}
+
+// ============================================================================
+// macOS 桌面套壳：.app 目录 + zip
+// ============================================================================
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacosBuildResult {
+    pub build_id: String,
+    pub dir: String,
+    pub app_path: String,
+    pub zip_path: Option<String>,
+    pub size_bytes: u64,
+    pub signed: bool,
+    pub duration_secs: u64,
+    pub log_path: String,
+}
+
+fn emit_mac_log(app: &AppHandle, stream: &str, line: &str) {
+    // macOS 构建复用桌面端的「构建日志」面板
+    let _ = app.emit(
+        "build-log-windows",
+        LogLine {
+            stream: stream.to_string(),
+            line: line.to_string(),
+        },
+    );
+}
+
+fn shell_host_macos_path(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        for candidate in [
+            resource_dir.join("shell-host-macos"),
+            resource_dir.join("binaries").join("shell-host-macos"),
+        ] {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries/shell-host-macos");
+    if dev.is_file() {
+        return Ok(dev);
+    }
+    Err("未找到 shell-host-macos：请在 macOS 上编译后放到 src-tauri/binaries/shell-host-macos".into())
+}
+
+/// CFBundleExecutable 只能放 ASCII 名字，中文应用名会被过滤掉。
+fn macos_exe_name(app_name: &str) -> String {
+    let cleaned: String = app_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if cleaned.is_empty() {
+        "app".to_string()
+    } else {
+        cleaned
+    }
+}
+
+fn macos_bundle_id(request: &WindowsBuildRequest) -> String {
+    if let Some(id) = request
+        .bundle_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return id.to_string();
+    }
+    let pkg = request.package_name.trim();
+    if pkg.contains('.')
+        && pkg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return pkg.to_string();
+    }
+    format!(
+        "com.jianling.{}",
+        macos_exe_name(&request.app_name).to_ascii_lowercase()
+    )
+}
+
+fn plist_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn write_macos_info_plist(
+    dest: &Path,
+    request: &WindowsBuildRequest,
+    exe: &str,
+    bundle_id: &str,
+    icon: Option<&str>,
+) -> Result<(), String> {
+    let name = plist_escape(request.app_name.trim());
+    let raw_version = request.version_name.trim();
+    let version = if raw_version.is_empty() {
+        "1.0.0"
+    } else {
+        raw_version
+    };
+    let mut extra = String::new();
+    let wants = |state: &str| !state.eq_ignore_ascii_case("deny");
+    if wants(&request.permissions.microphone) {
+        extra.push_str("    <key>NSMicrophoneUsageDescription</key>\n    <string>应用需要访问麦克风</string>\n");
+    }
+    if wants(&request.permissions.camera) {
+        extra.push_str("    <key>NSCameraUsageDescription</key>\n    <string>应用需要访问摄像头</string>\n");
+    }
+    if wants(&request.permissions.geolocation) {
+        extra.push_str("    <key>NSLocationWhenInUseUsageDescription</key>\n    <string>应用需要获取位置信息</string>\n");
+    }
+    let icon_key = match icon {
+        Some(name) => format!(
+            "    <key>CFBundleIconFile</key>\n    <string>{}</string>\n",
+            plist_escape(name)
+        ),
+        None => String::new(),
+    };
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>{name}</string>
+    <key>CFBundleDisplayName</key>
+    <string>{name}</string>
+    <key>CFBundleIdentifier</key>
+    <string>{bundle_id}</string>
+    <key>CFBundleExecutable</key>
+    <string>{exe}</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>{version}</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+{icon_key}    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+{extra}</dict>
+</plist>
+"#
+    );
+    std::fs::write(dest, xml).map_err(|e| format!("写入 Info.plist 失败：{e}"))
+}
+
+fn install_macos_icon(
+    request: &WindowsBuildRequest,
+    resources: &Path,
+) -> Result<Option<String>, String> {
+    let Some(raw) = request
+        .icon_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let src = Path::new(raw);
+    if !src.is_file() {
+        return Ok(None);
+    }
+    let ext = src
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "icns" {
+        std::fs::copy(src, resources.join("icon.icns")).map_err(|e| format!("复制图标失败：{e}"))?;
+        return Ok(Some("icon.icns".to_string()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(name) = build_icns(src, resources)? {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// png/ico → iconset → icns（只在 macOS 上可用，依赖 sips 与 iconutil）。
+#[cfg(target_os = "macos")]
+fn build_icns(src: &Path, resources: &Path) -> Result<Option<String>, String> {
+    let iconset = resources.join("icon.iconset");
+    let _ = std::fs::remove_dir_all(&iconset);
+    std::fs::create_dir_all(&iconset).map_err(|e| format!("创建 iconset 失败：{e}"))?;
+    let src_text = src.to_string_lossy().to_string();
+    let sizes: [(u32, &str); 10] = [
+        (16, "16x16"),
+        (32, "16x16@2x"),
+        (32, "32x32"),
+        (64, "32x32@2x"),
+        (128, "128x128"),
+        (256, "128x128@2x"),
+        (256, "256x256"),
+        (512, "256x256@2x"),
+        (512, "512x512"),
+        (1024, "512x512@2x"),
+    ];
+    for (px, label) in sizes {
+        let out = iconset.join(format!("icon_{label}.png"));
+        let out_text = out.to_string_lossy().to_string();
+        let px_text = px.to_string();
+        let status = Command::new("sips")
+            .args(["-z", &px_text, &px_text, &src_text, "--out", &out_text])
+            .output();
+        match status {
+            Ok(result) if result.status.success() => {}
+            _ => {
+                let _ = std::fs::remove_dir_all(&iconset);
+                return Ok(None);
+            }
+        }
+    }
+    let icns = resources.join("icon.icns");
+    let iconset_text = iconset.to_string_lossy().to_string();
+    let icns_text = icns.to_string_lossy().to_string();
+    let status = Command::new("iconutil")
+        .args(["-c", "icns", &iconset_text, "-o", &icns_text])
+        .output();
+    let _ = std::fs::remove_dir_all(&iconset);
+    match status {
+        Ok(result) if result.status.success() => Ok(Some("icon.icns".to_string())),
+        _ => Ok(None),
+    }
+}
+
+fn sign_macos_app(app: &Path, identity: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = app.to_string_lossy().to_string();
+        let status = Command::new("codesign")
+            .args(["--force", "--deep", "--options", "runtime", "--sign", identity, &path])
+            .status()
+            .map_err(|e| format!("调用 codesign 失败：{e}"))?;
+        if !status.success() {
+            return Err(format!("codesign 签名失败（身份：{identity}）"));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, identity);
+        Err("macOS 签名只能在 macOS 上执行".to_string())
+    }
+}
+
+fn zip_app_directory(src: &Path, dest: &Path) -> Result<u64, String> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let file = std::fs::File::create(dest).map_err(|e| format!("创建压缩包失败：{e}"))?;
+    let mut writer = zip::ZipWriter::new(file);
+    zip_app_add(&mut writer, src, src)?;
+    writer
+        .finish()
+        .map_err(|e| format!("写入压缩包失败：{e}"))?;
+    Ok(std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0))
+}
+
+/// .app 里含可执行文件，zip 条目统一写 755，解压后能直接双击。
+fn zip_app_add<W: std::io::Write + std::io::Seek>(
+    writer: &mut zip::ZipWriter<W>,
+    base: &Path,
+    dir: &Path,
+) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("读取目录失败：{e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            zip_app_add(writer, base, &path)?;
+            continue;
+        }
+        let rel = path.strip_prefix(base).map_err(|e| e.to_string())?;
+        let name = rel.to_string_lossy().replace('\\', "/");
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755);
+        writer
+            .start_file(name, options)
+            .map_err(|e| format!("写入压缩条目失败：{e}"))?;
+        let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut file, writer).map_err(|e| format!("写入压缩条目失败：{e}"))?;
+    }
+    Ok(())
+}
+
+fn mac_app_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                total += mac_app_size(&child);
+            } else if let Ok(meta) = std::fs::metadata(&child) {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// 桌面壳（macOS / Linux）共用的 shell.json。Windows 仍用自己的构造（多 webview2 字段）。
+#[allow(clippy::too_many_arguments)]
+fn desktop_shell_json(
+    request: &WindowsBuildRequest,
+    app_name: &str,
+    local_index: Option<String>,
+    win_width: u32,
+    win_height: u32,
+    fullscreen: bool,
+    splash_image: Option<String>,
+    splash_bg: Option<String>,
+    splash_logo: Option<String>,
+    proxies: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "title": app_name,
+        "url": request.start_url.trim(),
+        "startQuery": request
+            .start_query
+            .trim()
+            .trim_start_matches(|c: char| c == '?' || c == '&'),
+        "localIndex": local_index,
+        "width": win_width as f64,
+        "height": win_height as f64,
+        "fullscreen": fullscreen,
+        "maximized": request.maximized && request.size_mode == "fixed",
+        "resizable": request.resizable,
+        "frameless": request.frameless,
+        "sizeMode": request.size_mode,
+        "aspectW": request.aspect_w.max(1),
+        "aspectH": request.aspect_h.max(1),
+        "alwaysOnTop": request.always_on_top,
+        "devtools": request.debug_enabled,
+        "singleInstance": request.single_instance,
+        "autoStart": request.auto_start,
+        "minimizeOnClose": request.minimize_on_close,
+        "closeMode": request.close_mode,
+        "zoom": request.zoom.clamp(0.5, 3.0),
+        "autoplay": request.autoplay,
+        "blockContextMenu": request.block_context_menu,
+        "blockTextSelect": request.block_text_select,
+        "hideScrollbars": request.hide_scrollbars,
+        "blockCtrlZoom": request.block_ctrl_zoom,
+        "blockBrowserKeys": request.block_browser_keys,
+        "externalLinksInBrowser": request.external_links_in_browser,
+        "minFontSize": request.min_font_size.min(96),
+        "ignoreCertErrors": request.ignore_cert_errors,
+        "progressBar": request.progress_bar,
+        "navBar": request.nav_bar,
+        "progressColor": normalize_css_color(&request.progress_color),
+        "progressHeight": request.progress_height.clamp(1, 12),
+        "uaMode": request.ua_mode.trim(),
+        "userAgent": request.user_agent.trim(),
+        "downloadToSubfolder": request.download_to_subfolder,
+        "minWidth": request.min_width,
+        "minHeight": request.min_height,
+        "rememberWindow": request.remember_window,
+        "localServer": {
+            "enabled": request.local_server.enabled,
+            "port": request.local_server.port,
+            "basePath": crate::config::normalize_base_path(&request.local_server.base_path),
+            "debugLog": request.local_server.debug_log,
+            "proxies": proxies
+        },
+        "splash": {
+            "enabled": request.splash.enabled,
+            "title": splash_title(&request.splash, &request.app_name),
+            "background": splash_background(&request.splash),
+            "backgroundImage": splash_bg,
+            "image": splash_image,
+            "logo": splash_logo,
+            "minShowMs": request.splash.min_show_ms.min(10000)
+        },
+        "permissions": {
+            "camera": request.permissions.camera,
+            "microphone": request.permissions.microphone,
+            "geolocation": request.permissions.geolocation,
+            "notifications": request.permissions.notifications,
+            "clipboard": request.permissions.clipboard,
+            "downloads": request.permissions.downloads,
+            "fileReadWrite": request.permissions.file_read_write
+        }
+    })
+}
+
+fn run_build_macos(app: &AppHandle, request: WindowsBuildRequest) -> Result<MacosBuildResult, String> {
+    let started = SystemTime::now();
+    let app_name = request.app_name.trim().to_string();
+    if app_name.is_empty() {
+        return Err("应用名不能为空".into());
+    }
+    let out_root = request
+        .output_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .ok_or("未指定产物输出目录")?;
+    std::fs::create_dir_all(&out_root).map_err(|e| format!("创建输出目录失败：{e}"))?;
+    let host = shell_host_macos_path(app)?;
+
+    let build_id = crate::watermark::new_build_id(
+        &format!("{app_name}|macos"),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    );
+    let version = sanitize_filename(request.version_name.trim());
+    let pkg = sanitize_filename(if request.package_name.trim().is_empty() {
+        app_name.as_str()
+    } else {
+        request.package_name.trim()
+    });
+    let stem = format!(
+        "{}-{}-{}-{}",
+        sanitize_filename(&app_name),
+        version,
+        pkg,
+        local_timestamp()
+    );
+    let dir = out_root.join(&stem);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建构建目录失败：{e}"))?;
+
+    let exe = macos_exe_name(&app_name);
+    let bundle = dir.join(format!("{}.app", sanitize_filename(&app_name)));
+    let contents = bundle.join("Contents");
+    let macos_dir = contents.join("MacOS");
+    let resources = contents.join("Resources");
+    std::fs::create_dir_all(&macos_dir).map_err(|e| format!("创建 .app 目录失败：{e}"))?;
+    std::fs::create_dir_all(&resources).map_err(|e| format!("创建 Resources 失败：{e}"))?;
+
+    let exe_path = macos_dir.join(&exe);
+    std::fs::copy(&host, &exe_path).map_err(|e| format!("复制 shell-host 失败：{e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let proxies: Vec<serde_json::Value> = request
+        .local_server
+        .proxies
+        .iter()
+        .filter(|rule| !rule.prefix.trim().is_empty() && !rule.target.trim().is_empty())
+        .map(|rule| {
+            serde_json::json!({
+                "prefix": rule.prefix.trim(),
+                "target": rule.target.trim(),
+                "rewriteOrigin": rule.rewrite_origin,
+                "insecure": rule.insecure,
+                "resolveIp": rule.resolve_ip.trim(),
+                "headers": rule.headers.trim()
+            })
+        })
+        .collect();
+
+    let local_index = if request.source_kind == "local" {
+        let source = request
+            .local_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("已选择本地静态包模式，但未指定 H5 目录或 zip")?;
+        let www = resources.join("www");
+        write_local_content(&www, Path::new(source))?;
+        if !www.join("index.html").is_file() {
+            return Err("本地 H5 根目录缺少 index.html".into());
+        }
+        let proxy_count = request
+            .local_server
+            .proxies
+            .iter()
+            .filter(|r| !r.prefix.trim().is_empty() && !r.target.trim().is_empty())
+            .count();
+        let meta = crate::watermark::BuildMeta::new(
+            build_id.clone(),
+            app_name.clone(),
+            exe.clone(),
+            request.version_name.trim().to_string(),
+            0,
+            "macos",
+            request.project_id.trim(),
+            &exe,
+            proxy_count,
+        );
+        match crate::watermark::watermark_index_html(&www, &meta) {
+            Ok(true) => emit_mac_log(app, "info", &format!("已写入页面水印：{build_id}")),
+            Ok(false) => {}
+            Err(e) => emit_mac_log(app, "warn", &format!("页面水印写入失败（不影响打包）：{e}")),
+        }
+        emit_mac_log(app, "info", &format!("已导入本地 H5 内容：{source}"));
+        Some("www/index.html".to_string())
+    } else {
+        let url = request.start_url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("H5 首页地址需以 http:// 或 https:// 开头".into());
+        }
+        None
+    };
+
+    let aspect_w = request.aspect_w.max(1);
+    let aspect_h = request.aspect_h.max(1);
+    let width = request.width.clamp(320, 7680);
+    let (win_width, win_height, fullscreen) = match request.size_mode.as_str() {
+        "ratio" => {
+            let height = ((width as f64) * (aspect_h as f64) / (aspect_w as f64)).round() as u32;
+            (width, height.clamp(240, 4320), false)
+        }
+        "fullscreen" => (width, request.height.clamp(240, 4320), true),
+        _ => (width, request.height.clamp(240, 4320), false),
+    };
+
+    let custom_mode = request.splash.mode.trim() == "custom";
+    let splash_image = if custom_mode {
+        copy_splash_image(&request.splash.image_path, &resources, "splash")?
+    } else {
+        None
+    };
+    let splash_bg = if custom_mode {
+        None
+    } else {
+        copy_splash_image(&request.splash.background_image, &resources, "splash-bg")?
+    };
+    let logo_source = request
+        .splash
+        .logo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            request
+                .icon_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+    let splash_logo = copy_splash_image(&logo_source, &resources, "logo")?;
+
+    let has_icon = request
+        .icon_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let icon = install_macos_icon(&request, &resources)?;
+    if has_icon && icon.is_none() {
+        emit_mac_log(
+            app,
+            "warn",
+            "图标需要 .icns；当前系统无法把 png/ico 转成 icns，已跳过",
+        );
+    }
+
+    let config = desktop_shell_json(
+        &request,
+        &app_name,
+        local_index,
+        win_width,
+        win_height,
+        fullscreen,
+        splash_image,
+        splash_bg,
+        splash_logo,
+        proxies,
+    );
+    let raw = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(resources.join("shell.json"), raw)
+        .map_err(|e| format!("写入 shell.json 失败：{e}"))?;
+
+    let bundle_id = macos_bundle_id(&request);
+    write_macos_info_plist(
+        &contents.join("Info.plist"),
+        &request,
+        &exe,
+        &bundle_id,
+        icon.as_deref(),
+    )?;
+
+    let mut signed = false;
+    if let Some(identity) = request
+        .sign_identity
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if cfg!(target_os = "macos") {
+            sign_macos_app(&bundle, identity)?;
+            signed = true;
+            emit_mac_log(app, "info", &format!("已签名：{identity}"));
+        } else {
+            emit_mac_log(
+                app,
+                "warn",
+                "签名需要 macOS 上的 codesign，本次跳过，输出未签名 .app",
+            );
+        }
+    } else {
+        emit_mac_log(app, "info", "未配置签名身份，输出未签名 .app");
+    }
+
+    let zip_path = dir.join(format!("{stem}-mac.zip"));
+    let zip = match zip_app_directory(&dir, &zip_path) {
+        Ok(_) => Some(zip_path.to_string_lossy().to_string()),
+        Err(e) => {
+            emit_mac_log(app, "warn", &format!("打包 zip 失败（.app 目录仍可用）：{e}"));
+            None
+        }
+    };
+
+    let duration_secs = SystemTime::now()
+        .duration_since(started)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let size_bytes = mac_app_size(&bundle);
+    let log_path = out_root.join(format!("{stem}-build.log"));
+    let log_text = format!(
+        "应用：{app_name}\n版本：{}\nBundle ID：{bundle_id}\n产物：{}\n签名：{}\n耗时：{duration_secs}s\n",
+        request.version_name.trim(),
+        bundle.display(),
+        if signed { "是" } else { "否" }
+    );
+    let _ = std::fs::write(&log_path, log_text);
+    emit_mac_log(app, "info", &format!("构建完成：{}", bundle.display()));
+
+    Ok(MacosBuildResult {
+        build_id,
+        dir: dir.to_string_lossy().to_string(),
+        app_path: bundle.to_string_lossy().to_string(),
+        zip_path: zip,
+        size_bytes,
+        signed,
+        duration_secs,
+        log_path: log_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn build_macos(
+    app: AppHandle,
+    request: WindowsBuildRequest,
+) -> Result<MacosBuildResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_build_macos(&app, request))
+        .await
+        .map_err(|e| format!("构建线程异常: {e}"))?
+}
+
+// ============================================================================
+// Linux 桌面套壳：可执行文件 + www + shell.json + 启动脚本
+// ============================================================================
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxBuildResult {
+    pub build_id: String,
+    pub dir: String,
+    pub exe_path: String,
+    pub zip_path: Option<String>,
+    pub size_bytes: u64,
+    pub duration_secs: u64,
+    pub log_path: String,
+}
+
+fn emit_linux_log(app: &AppHandle, stream: &str, line: &str) {
+    let _ = app.emit(
+        "build-log-windows",
+        LogLine {
+            stream: stream.to_string(),
+            line: line.to_string(),
+        },
+    );
+}
+
+fn shell_host_linux_path(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        for candidate in [
+            resource_dir.join("shell-host-linux"),
+            resource_dir.join("binaries").join("shell-host-linux"),
+        ] {
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries/shell-host-linux");
+    if dev.is_file() {
+        return Ok(dev);
+    }
+    Err("未找到 shell-host-linux：请在 Linux 上编译后放到 src-tauri/binaries/shell-host-linux".into())
+}
+
+/// 可执行文件名只留 ASCII，中文应用名统一退回 app。
+fn linux_exe_name(app_name: &str) -> String {
+    let mut out = String::new();
+    for ch in app_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "app".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn install_linux_icon(request: &WindowsBuildRequest, dir: &Path) -> Result<Option<String>, String> {
+    let Some(raw) = request
+        .icon_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let src = Path::new(raw);
+    if !src.is_file() {
+        return Ok(None);
+    }
+    let ext = src
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext != "png" {
+        return Ok(None);
+    }
+    std::fs::copy(src, dir.join("icon.png")).map_err(|e| format!("复制图标失败：{e}"))?;
+    Ok(Some("icon.png".to_string()))
+}
+
+fn run_build_linux(app: &AppHandle, request: WindowsBuildRequest) -> Result<LinuxBuildResult, String> {
+    let started = SystemTime::now();
+    let app_name = request.app_name.trim().to_string();
+    if app_name.is_empty() {
+        return Err("应用名不能为空".into());
+    }
+    let out_root = request
+        .output_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .ok_or("未指定产物输出目录")?;
+    std::fs::create_dir_all(&out_root).map_err(|e| format!("创建输出目录失败：{e}"))?;
+    let host = shell_host_linux_path(app)?;
+
+    let build_id = crate::watermark::new_build_id(
+        &format!("{app_name}|linux"),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    );
+    let version = sanitize_filename(request.version_name.trim());
+    let pkg = sanitize_filename(if request.package_name.trim().is_empty() {
+        app_name.as_str()
+    } else {
+        request.package_name.trim()
+    });
+    let stem = format!(
+        "{}-{}-{}-{}",
+        sanitize_filename(&app_name),
+        version,
+        pkg,
+        local_timestamp()
+    );
+    let dir = out_root.join(&stem);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建构建目录失败：{e}"))?;
+
+    let exe = linux_exe_name(&app_name);
+    let exe_path = dir.join(&exe);
+    std::fs::copy(&host, &exe_path).map_err(|e| format!("复制 shell-host 失败：{e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let proxies: Vec<serde_json::Value> = request
+        .local_server
+        .proxies
+        .iter()
+        .filter(|rule| !rule.prefix.trim().is_empty() && !rule.target.trim().is_empty())
+        .map(|rule| {
+            serde_json::json!({
+                "prefix": rule.prefix.trim(),
+                "target": rule.target.trim(),
+                "rewriteOrigin": rule.rewrite_origin,
+                "insecure": rule.insecure,
+                "resolveIp": rule.resolve_ip.trim(),
+                "headers": rule.headers.trim()
+            })
+        })
+        .collect();
+
+    let local_index = if request.source_kind == "local" {
+        let source = request
+            .local_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or("已选择本地静态包模式，但未指定 H5 目录或 zip")?;
+        let www = dir.join("www");
+        write_local_content(&www, Path::new(source))?;
+        if !www.join("index.html").is_file() {
+            return Err("本地 H5 根目录缺少 index.html".into());
+        }
+        let proxy_count = request
+            .local_server
+            .proxies
+            .iter()
+            .filter(|r| !r.prefix.trim().is_empty() && !r.target.trim().is_empty())
+            .count();
+        let meta = crate::watermark::BuildMeta::new(
+            build_id.clone(),
+            app_name.clone(),
+            exe.clone(),
+            request.version_name.trim().to_string(),
+            0,
+            "linux",
+            request.project_id.trim(),
+            &exe,
+            proxy_count,
+        );
+        match crate::watermark::watermark_index_html(&www, &meta) {
+            Ok(true) => emit_linux_log(app, "info", &format!("已写入页面水印：{build_id}")),
+            Ok(false) => {}
+            Err(e) => emit_linux_log(app, "warn", &format!("页面水印写入失败（不影响打包）：{e}")),
+        }
+        emit_linux_log(app, "info", &format!("已导入本地 H5 内容：{source}"));
+        Some("www/index.html".to_string())
+    } else {
+        let url = request.start_url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err("H5 首页地址需以 http:// 或 https:// 开头".into());
+        }
+        None
+    };
+
+    let aspect_w = request.aspect_w.max(1);
+    let aspect_h = request.aspect_h.max(1);
+    let width = request.width.clamp(320, 7680);
+    let (win_width, win_height, fullscreen) = match request.size_mode.as_str() {
+        "ratio" => {
+            let height = ((width as f64) * (aspect_h as f64) / (aspect_w as f64)).round() as u32;
+            (width, height.clamp(240, 4320), false)
+        }
+        "fullscreen" => (width, request.height.clamp(240, 4320), true),
+        _ => (width, request.height.clamp(240, 4320), false),
+    };
+
+    let custom_mode = request.splash.mode.trim() == "custom";
+    let splash_image = if custom_mode {
+        copy_splash_image(&request.splash.image_path, &dir, "splash")?
+    } else {
+        None
+    };
+    let splash_bg = if custom_mode {
+        None
+    } else {
+        copy_splash_image(&request.splash.background_image, &dir, "splash-bg")?
+    };
+    let logo_source = request
+        .splash
+        .logo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            request
+                .icon_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+    let splash_logo = copy_splash_image(&logo_source, &dir, "logo")?;
+
+    let has_icon = request
+        .icon_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let icon = install_linux_icon(&request, &dir)?;
+    if has_icon && icon.is_none() {
+        emit_linux_log(app, "warn", "Linux 图标需要 png，已跳过");
+    }
+
+    let config = desktop_shell_json(
+        &request,
+        &app_name,
+        local_index,
+        win_width,
+        win_height,
+        fullscreen,
+        splash_image,
+        splash_bg,
+        splash_logo,
+        proxies,
+    );
+    let raw = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("shell.json"), raw)
+        .map_err(|e| format!("写入 shell.json 失败：{e}"))?;
+
+    let run_sh = dir.join("run.sh");
+    std::fs::write(
+        &run_sh,
+        format!("#!/bin/sh\ncd \"$(dirname \"$0\")\"\nexec ./{exe}\n"),
+    )
+    .map_err(|e| format!("写入 run.sh 失败：{e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&run_sh, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let desktop = dir.join(format!("{exe}.desktop"));
+    std::fs::write(
+        &desktop,
+        format!(
+            "[Desktop Entry]\nType=Application\nName={app_name}\nExec={}/{exe}\nIcon={}/icon.png\nTerminal=false\nCategories=Network;\n",
+            dir.display(),
+            dir.display()
+        ),
+    )
+    .map_err(|e| format!("写入 .desktop 失败：{e}"))?;
+
+    let zip_path = out_root.join(format!("{stem}-linux.zip"));
+    let zip = match zip_app_directory(&dir, &zip_path) {
+        Ok(_) => Some(zip_path.to_string_lossy().to_string()),
+        Err(e) => {
+            emit_linux_log(app, "warn", &format!("打包 zip 失败（目录仍可用）：{e}"));
+            None
+        }
+    };
+
+    let duration_secs = SystemTime::now()
+        .duration_since(started)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let size_bytes = mac_app_size(&dir);
+    let log_path = out_root.join(format!("{stem}-build.log"));
+    let log_text = format!(
+        "应用：{app_name}\n版本：{}\n产物：{}\n耗时：{duration_secs}s\n",
+        request.version_name.trim(),
+        exe_path.display()
+    );
+    let _ = std::fs::write(&log_path, log_text);
+    emit_linux_log(app, "info", &format!("构建完成：{}", exe_path.display()));
+
+    Ok(LinuxBuildResult {
+        build_id,
+        dir: dir.to_string_lossy().to_string(),
+        exe_path: exe_path.to_string_lossy().to_string(),
+        zip_path: zip,
+        size_bytes,
+        duration_secs,
+        log_path: log_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn build_linux(
+    app: AppHandle,
+    request: WindowsBuildRequest,
+) -> Result<LinuxBuildResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_build_linux(&app, request))
+        .await
+        .map_err(|e| format!("构建线程异常: {e}"))?
+}
+
+// ============================================================================
+// HarmonyOS NEXT 套壳：生成 DevEco Studio 工程（ArkTS + ArkWeb）
+// ============================================================================
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarmonyBuildResult {
+    pub build_id: String,
+    pub dir: String,
+    pub project_path: String,
+    pub zip_path: Option<String>,
+    pub size_bytes: u64,
+    pub duration_secs: u64,
+    pub log_path: String,
+}
+
+fn emit_harmony_log(app: &AppHandle, stream: &str, line: &str) {
+    let _ = app.emit(
+        "build-log-windows",
+        LogLine {
+            stream: stream.to_string(),
+            line: line.to_string(),
+        },
+    );
+}
+
+fn harmony_template_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    resource_template_dir(app, "harmony-template")
+}
+
+/// 定位 resources 下的工程模板（开发目录与打包后的资源目录都支持）。
+fn resource_template_dir(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    if let Ok(resource) = app.path().resource_dir() {
+        for candidate in [
+            resource.join("resources").join(name),
+            resource.join(name),
+        ] {
+            if candidate.is_dir() {
+                return Ok(candidate);
+            }
+        }
+    }
+    let dev = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join(name);
+    if dev.is_dir() {
+        return Ok(dev);
+    }
+    Err(format!("未找到工程模板：resources/{name}"))
+}
+
+/// 递归替换工程里的占位符，只处理文本文件。
+fn replace_in_tree(dir: &Path, pairs: &[(&str, String)]) -> Result<(), String> {
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("读取模板失败：{e}"))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            replace_in_tree(&path, pairs)?;
+            continue;
+        }
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(
+            ext.as_str(),
+            "json5" | "json" | "ts" | "ets" | "plist" | "yml" | "yaml" | "swift"
+        ) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+        let mut next = text.clone();
+        for (needle, value) in pairs {
+            next = next.replace(needle, value);
+        }
+        if next != text {
+            std::fs::write(&path, next).map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn harmony_bundle_name(request: &WindowsBuildRequest) -> String {
+    let pkg = request.package_name.trim();
+    if pkg.contains('.')
+        && pkg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        return pkg.to_string();
+    }
+    format!(
+        "com.jianling.{}",
+        macos_exe_name(&request.app_name).to_ascii_lowercase()
+    )
+}
+
+fn harmony_permissions(request: &WindowsBuildRequest) -> String {
+    let wants = |state: &str| !state.eq_ignore_ascii_case("deny");
+    let mut names: Vec<&str> = Vec::new();
+    if wants(&request.permissions.camera) {
+        names.push("ohos.permission.CAMERA");
+    }
+    if wants(&request.permissions.microphone) {
+        names.push("ohos.permission.MICROPHONE");
+    }
+    if wants(&request.permissions.geolocation) {
+        names.push("ohos.permission.APPROXIMATELY_LOCATION");
+        names.push("ohos.permission.LOCATION");
+    }
+    let mut out = String::new();
+    for name in names {
+        out.push_str(&format!(",\n      {{\n        \"name\": \"{name}\"\n      }}"));
+    }
+    out
+}
+
+fn escape_ts_text(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+fn run_build_harmony(
+    app: &AppHandle,
+    request: WindowsBuildRequest,
+) -> Result<HarmonyBuildResult, String> {
+    let started = SystemTime::now();
+    let app_name = request.app_name.trim().to_string();
+    if app_name.is_empty() {
+        return Err("应用名不能为空".into());
+    }
+    let out_root = request
+        .output_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .ok_or("未指定产物输出目录")?;
+    std::fs::create_dir_all(&out_root).map_err(|e| format!("创建输出目录失败：{e}"))?;
+    let template = harmony_template_dir(app)?;
+
+    let build_id = crate::watermark::new_build_id(
+        &format!("{app_name}|harmony"),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    );
+    let version = sanitize_filename(request.version_name.trim());
+    let pkg = sanitize_filename(if request.package_name.trim().is_empty() {
+        app_name.as_str()
+    } else {
+        request.package_name.trim()
+    });
+    let stem = format!(
+        "{}-{}-{}-{}",
+        sanitize_filename(&app_name),
+        version,
+        pkg,
+        local_timestamp()
+    );
+    let dir = out_root.join(&stem);
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&template, &dir).map_err(|e| format!("复制工程模板失败：{e}"))?;
+    emit_harmony_log(app, "info", "已复制鸿蒙工程模板");
+
+    // 图标：用户的 png 优先，否则用模板里的占位图
+    let placeholder = dir.join("placeholder-icon.png");
+    let user_icon = request
+        .icon_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .map(|e| e.eq_ignore_ascii_case("png"))
+                    .unwrap_or(false)
+        });
+    let icon_src = user_icon.unwrap_or_else(|| placeholder.clone());
+    if placeholder.is_file() && icon_src != placeholder {
+        let _ = std::fs::remove_file(&placeholder);
+    }
+    for target in [
+        "AppScope/resources/base/media/app_icon.png",
+        "entry/src/main/resources/base/media/icon.png",
+        "entry/src/main/resources/base/media/startIcon.png",
+    ] {
+        let dest = dir.join(target);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建图标目录失败：{e}"))?;
+        }
+        std::fs::copy(&icon_src, &dest).map_err(|e| format!("复制图标失败：{e}"))?;
+    }
+
+    let local = request.source_kind == "local"
+        && request
+            .local_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some();
+    let entry_url = request.start_url.trim().to_string();
+    if local {
+        let source = request.local_dir.as_deref().map(str::trim).unwrap_or("");
+        let www = dir.join("entry/src/main/resources/rawfile/www");
+        write_local_content(&www, Path::new(source))?;
+        if !www.join("index.html").is_file() {
+            return Err("本地 H5 根目录缺少 index.html".into());
+        }
+        let meta = crate::watermark::BuildMeta::new(
+            build_id.clone(),
+            app_name.clone(),
+            pkg.clone(),
+            request.version_name.trim().to_string(),
+            0,
+            "harmony",
+            request.project_id.trim(),
+            "hap",
+            0,
+        );
+        match crate::watermark::watermark_index_html(&www, &meta) {
+            Ok(true) => emit_harmony_log(app, "info", &format!("已写入页面水印：{build_id}")),
+            Ok(false) => {}
+            Err(e) => emit_harmony_log(app, "warn", &format!("页面水印写入失败（不影响打包）：{e}")),
+        }
+        emit_harmony_log(app, "info", &format!("已导入本地 H5 内容：{source}"));
+    } else {
+        if !(entry_url.starts_with("http://") || entry_url.starts_with("https://")) {
+            return Err("H5 首页地址需以 http:// 或 https:// 开头".into());
+        }
+        // Index.ets 里用了 $rawfile，远程模式也放一个占位页，避免编译期找不到资源
+        let www = dir.join("entry/src/main/resources/rawfile/www");
+        std::fs::create_dir_all(&www).map_err(|e| format!("创建 rawfile 目录失败：{e}"))?;
+        std::fs::write(
+            www.join("index.html"),
+            "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>",
+        )
+        .map_err(|e| format!("写入占位页失败：{e}"))?;
+        emit_harmony_log(app, "info", &format!("远程地址：{entry_url}"));
+    }
+
+    let config_ts = format!(
+        "export class AppConfig {{\n  static readonly local: boolean = {};\n  static readonly entry: string = '{}';\n  static readonly zoom: boolean = {};\n}}\n",
+        local,
+        escape_ts_text(&entry_url),
+        request.zoom > 1.0
+    );
+    std::fs::write(dir.join("entry/src/main/ets/pages/AppConfig.ets"), config_ts)
+        .map_err(|e| format!("写入 AppConfig.ets 失败：{e}"))?;
+
+    let bundle_name = harmony_bundle_name(&request);
+    let pairs = vec![
+        ("__BUNDLE_NAME__", bundle_name.clone()),
+        ("__APP_NAME__", app_name.clone()),
+        (
+            "__VERSION_NAME__",
+            request.version_name.trim().to_string(),
+        ),
+        ("__VERSION_CODE__", "1".to_string()),
+        (
+            "__EXE_NAME__",
+            linux_exe_name(&app_name),
+        ),
+        ("__EXTRA_PERMISSIONS__", harmony_permissions(&request)),
+    ];
+    replace_in_tree(&dir, &pairs)?;
+    emit_harmony_log(app, "info", &format!("工程已生成：{}", dir.display()));
+
+    let zip_path = out_root.join(format!("{stem}-harmony.zip"));
+    let zip = match zip_app_directory(&dir, &zip_path) {
+        Ok(_) => Some(zip_path.to_string_lossy().to_string()),
+        Err(e) => {
+            emit_harmony_log(app, "warn", &format!("打包 zip 失败（工程目录仍可用）：{e}"));
+            None
+        }
+    };
+
+    let duration_secs = SystemTime::now()
+        .duration_since(started)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let size_bytes = mac_app_size(&dir);
+    let log_path = out_root.join(format!("{stem}-build.log"));
+    let log_text = format!(
+        "应用：{app_name}\nBundle：{bundle_name}\n版本：{}\n工程：{}\n下一步：用 DevEco Studio 打开工程，配置签名后构建 HAP。\n耗时：{duration_secs}s\n",
+        request.version_name.trim(),
+        dir.display()
+    );
+    let _ = std::fs::write(&log_path, log_text);
+    emit_harmony_log(
+        app,
+        "info",
+        "鸿蒙工程已生成，签名与 HAP 构建需要在 DevEco Studio 里完成",
+    );
+
+    Ok(HarmonyBuildResult {
+        build_id,
+        dir: dir.to_string_lossy().to_string(),
+        project_path: dir.to_string_lossy().to_string(),
+        zip_path: zip,
+        size_bytes,
+        duration_secs,
+        log_path: log_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn build_harmony(
+    app: AppHandle,
+    request: WindowsBuildRequest,
+) -> Result<HarmonyBuildResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_build_harmony(&app, request))
+        .await
+        .map_err(|e| format!("构建线程异常: {e}"))?
+}
+
+// ============================================================================
+// iOS 套壳：生成 XcodeGen 工程（Swift + WKWebView）
+// ============================================================================
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IosBuildResult {
+    pub build_id: String,
+    pub dir: String,
+    pub project_path: String,
+    /// 若本机装了 xcodegen，这里会给出生成的 .xcodeproj
+    pub xcodeproj: Option<String>,
+    pub zip_path: Option<String>,
+    pub size_bytes: u64,
+    pub duration_secs: u64,
+    pub log_path: String,
+}
+
+fn emit_ios_log(app: &AppHandle, stream: &str, line: &str) {
+    let _ = app.emit(
+        "build-log-windows",
+        LogLine {
+            stream: stream.to_string(),
+            line: line.to_string(),
+        },
+    );
+}
+
+fn ios_permissions(request: &WindowsBuildRequest) -> String {
+    let wants = |state: &str| !state.eq_ignore_ascii_case("deny");
+    let mut out = String::new();
+    if wants(&request.permissions.camera) {
+        out.push_str("    <key>NSCameraUsageDescription</key>\n    <string>应用需要访问摄像头</string>\n");
+    }
+    if wants(&request.permissions.microphone) {
+        out.push_str("    <key>NSMicrophoneUsageDescription</key>\n    <string>应用需要访问麦克风</string>\n");
+    }
+    if wants(&request.permissions.geolocation) {
+        out.push_str("    <key>NSLocationWhenInUseUsageDescription</key>\n    <string>应用需要获取位置信息</string>\n");
+    }
+    out
+}
+
+fn escape_swift(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn run_build_ios(app: &AppHandle, request: WindowsBuildRequest) -> Result<IosBuildResult, String> {
+    let started = SystemTime::now();
+    let app_name = request.app_name.trim().to_string();
+    if app_name.is_empty() {
+        return Err("应用名不能为空".into());
+    }
+    let out_root = request
+        .output_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .ok_or("未指定产物输出目录")?;
+    std::fs::create_dir_all(&out_root).map_err(|e| format!("创建输出目录失败：{e}"))?;
+    let template = resource_template_dir(app, "ios-template")?;
+
+    let build_id = crate::watermark::new_build_id(
+        &format!("{app_name}|ios"),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+    );
+    let target = linux_exe_name(&app_name);
+    let version = sanitize_filename(request.version_name.trim());
+    let pkg = sanitize_filename(if request.package_name.trim().is_empty() {
+        app_name.as_str()
+    } else {
+        request.package_name.trim()
+    });
+    let stem = format!(
+        "{}-{}-{}-{}",
+        sanitize_filename(&app_name),
+        version,
+        pkg,
+        local_timestamp()
+    );
+    let dir = out_root.join(&stem);
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&template, &dir).map_err(|e| format!("复制工程模板失败：{e}"))?;
+    emit_ios_log(app, "info", "已复制 iOS 工程模板");
+
+    // 图标：用户 png 优先，否则用模板占位图
+    let placeholder = dir.join("placeholder-icon.png");
+    let user_icon = request
+        .icon_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .map(|e| e.eq_ignore_ascii_case("png"))
+                    .unwrap_or(false)
+        });
+    let icon_src = user_icon.unwrap_or_else(|| placeholder.clone());
+    std::fs::copy(
+        &icon_src,
+        dir.join("Sources/Assets.xcassets/AppIcon.appiconset/icon-1024.png"),
+    )
+    .map_err(|e| format!("复制图标失败：{e}"))?;
+    if placeholder.is_file() {
+        let _ = std::fs::remove_file(&placeholder);
+    }
+
+    let local = request.source_kind == "local"
+        && request
+            .local_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some();
+    let entry_url = request.start_url.trim().to_string();
+    let www = dir.join("Resources/www");
+    std::fs::create_dir_all(&www).map_err(|e| format!("创建 www 失败：{e}"))?;
+    if local {
+        let source = request.local_dir.as_deref().map(str::trim).unwrap_or("");
+        write_local_content(&www, Path::new(source))?;
+        if !www.join("index.html").is_file() {
+            return Err("本地 H5 根目录缺少 index.html".into());
+        }
+        let meta = crate::watermark::BuildMeta::new(
+            build_id.clone(),
+            app_name.clone(),
+            pkg.clone(),
+            request.version_name.trim().to_string(),
+            0,
+            "ios",
+            request.project_id.trim(),
+            "app",
+            0,
+        );
+        match crate::watermark::watermark_index_html(&www, &meta) {
+            Ok(true) => emit_ios_log(app, "info", &format!("已写入页面水印：{build_id}")),
+            Ok(false) => {}
+            Err(e) => emit_ios_log(app, "warn", &format!("页面水印写入失败（不影响打包）：{e}")),
+        }
+        emit_ios_log(app, "info", &format!("已导入本地 H5 内容：{source}"));
+    } else {
+        if !(entry_url.starts_with("http://") || entry_url.starts_with("https://")) {
+            return Err("H5 首页地址需以 http:// 或 https:// 开头".into());
+        }
+        // 远程模式也放个占位页，保证 bundle 里的 www 目录存在
+        std::fs::write(
+            www.join("index.html"),
+            "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>",
+        )
+        .map_err(|e| format!("写入占位页失败：{e}"))?;
+        emit_ios_log(app, "info", &format!("远程地址：{entry_url}"));
+    }
+
+    let config_swift = format!(
+        "import Foundation\n\nenum AppConfig {{\n    static let startUrl = \"{}\"\n    static let useLocalContent = {}\n}}\n",
+        escape_swift(&entry_url),
+        local
+    );
+    std::fs::write(dir.join("Sources/Config.swift"), config_swift)
+        .map_err(|e| format!("写入 Config.swift 失败：{e}"))?;
+
+    let bundle_id = request
+        .bundle_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("com.jianling.{target}"));
+    let pairs = vec![
+        ("__BUNDLE_ID__", bundle_id.clone()),
+        ("__APP_NAME__", app_name.clone()),
+        (
+            "__VERSION__",
+            request.version_name.trim().to_string(),
+        ),
+        ("__TARGET_NAME__", target.clone()),
+        ("__PERMISSIONS__", ios_permissions(&request)),
+    ];
+    replace_in_tree(&dir, &pairs)?;
+    emit_ios_log(app, "info", &format!("工程已生成：{}", dir.display()));
+
+    // 装了 xcodegen 就顺手生成 .xcodeproj（只有 macOS 上会有）
+    let xcodeproj = match Command::new("xcodegen")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            match Command::new("xcodegen")
+                .arg("generate")
+                .current_dir(&dir)
+                .output()
+            {
+                Ok(result) if result.status.success() => {
+                    let project = dir.join(format!("{target}.xcodeproj"));
+                    emit_ios_log(app, "info", "已用 xcodegen 生成 .xcodeproj");
+                    project.is_dir().then(|| project.to_string_lossy().to_string())
+                }
+                Ok(result) => {
+                    emit_ios_log(
+                        app,
+                        "warn",
+                        &format!(
+                            "xcodegen 生成失败：{}",
+                            String::from_utf8_lossy(&result.stderr).trim()
+                        ),
+                    );
+                    None
+                }
+                Err(e) => {
+                    emit_ios_log(app, "warn", &format!("调用 xcodegen 失败：{e}"));
+                    None
+                }
+            }
+        }
+        _ => {
+            emit_ios_log(
+                app,
+                "warn",
+                "未检测到 xcodegen：工程已生成，打开前先执行 xcodegen generate，或在 Xcode 里新建工程并拖入 Sources/Resources",
+            );
+            None
+        }
+    };
+
+    let zip_path = out_root.join(format!("{stem}-ios.zip"));
+    let zip = match zip_app_directory(&dir, &zip_path) {
+        Ok(_) => Some(zip_path.to_string_lossy().to_string()),
+        Err(e) => {
+            emit_ios_log(app, "warn", &format!("打包 zip 失败（工程目录仍可用）：{e}"));
+            None
+        }
+    };
+
+    let duration_secs = SystemTime::now()
+        .duration_since(started)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let size_bytes = mac_app_size(&dir);
+    let log_path = out_root.join(format!("{stem}-build.log"));
+    let log_text = format!(
+        "应用：{app_name}\nBundle：{bundle_id}\n版本：{}\n工程：{}\n下一步：在 macOS 上用 Xcode 打开工程，配置签名后运行或导出 ipa。\n耗时：{duration_secs}s\n",
+        request.version_name.trim(),
+        dir.display()
+    );
+    let _ = std::fs::write(&log_path, log_text);
+    emit_ios_log(
+        app,
+        "info",
+        "iOS 工程已生成，签名与 ipa 导出需要在 macOS 上用 Xcode 完成",
+    );
+
+    Ok(IosBuildResult {
+        build_id,
+        dir: dir.to_string_lossy().to_string(),
+        project_path: dir.to_string_lossy().to_string(),
+        xcodeproj,
+        zip_path: zip,
+        size_bytes,
+        duration_secs,
+        log_path: log_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn build_ios(
+    app: AppHandle,
+    request: WindowsBuildRequest,
+) -> Result<IosBuildResult, String> {
+    tauri::async_runtime::spawn_blocking(move || run_build_ios(&app, request))
         .await
         .map_err(|e| format!("构建线程异常: {e}"))?
 }

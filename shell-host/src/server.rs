@@ -9,8 +9,8 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -18,6 +18,10 @@ const MAX_HEAD: usize = 64 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 /// WebSocket 隧道的轮询间隔（双向搬运靠短读超时实现）。
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// WS 隧道双向完全静默超过该时长判定为死连接，回收线程与连接。
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// 每条转发规则保留的空闲上游连接数（避免每个请求都重新 TCP/TLS 握手）。
+const MAX_IDLE_PER_RULE: usize = 2;
 
 /// 单条转发规则。
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +59,8 @@ pub struct Config {
     pub port: u16,
     /// 部署目录，形如 "/" 或 "/h5/"：访问路径去掉这个前缀后再映射到文件
     pub base_path: String,
+    /// 调试流量日志：显式开启才记录，日志落在 `%TEMP%\jianling-logs`
+    pub debug_log: bool,
     pub proxies: Vec<Rule>,
 }
 
@@ -64,6 +70,7 @@ impl Default for Config {
             enabled: false,
             port: 0,
             base_path: "/".to_string(),
+            debug_log: false,
             proxies: Vec::new(),
         }
     }
@@ -91,6 +98,8 @@ struct Upstream {
     resolve_ip: String,
     /// 追加到上游请求的 header（来自规则的 headers JSON，非法时为空）
     extra_headers: Vec<(String, String)>,
+    /// 该规则的空闲上游连接池（只有幂等请求取用 / 归还）
+    idle: Mutex<Vec<Io>>,
 }
 
 struct Ctx {
@@ -98,6 +107,48 @@ struct Ctx {
     index: String,
     base: String,
     rules: Vec<(String, Upstream)>,
+    /// 调试流量日志；未开启时为 None，不产生任何文件
+    traffic: Option<TrafficLog>,
+}
+
+impl Ctx {
+    fn traffic_line(&self, text: &str) {
+        if let Some(traffic) = &self.traffic {
+            traffic.line(text);
+        }
+    }
+
+    fn log_http(
+        &self,
+        req: &Req,
+        upstream: &Upstream,
+        status: u16,
+        cost: Duration,
+        body_bytes: Option<u64>,
+    ) {
+        if self.traffic.is_none() {
+            return;
+        }
+        let content_type = req
+            .header("content-type")
+            .map(|v| format!(" req={v}"))
+            .unwrap_or_default();
+        let size = match body_bytes {
+            Some(bytes) => format!("{bytes}B"),
+            None => "chunked".to_string(),
+        };
+        self.traffic_line(&format!(
+            "HTTP {} {} -> {}:{} {} {}ms {}{}",
+            req.method,
+            safe_path(&req.path),
+            upstream.host,
+            upstream.port,
+            status,
+            cost.as_millis(),
+            size,
+            content_type
+        ));
+    }
 }
 
 /// 未显式配置端口时按站点根目录派生稳定端口：
@@ -163,11 +214,23 @@ pub fn start(cfg: &Config, root: PathBuf, index: String, logger: fn(&str)) -> Re
         root.display()
     ));
 
+    let traffic = if cfg.debug_log {
+        let log = TrafficLog::create();
+        match &log {
+            Some(log) => logger(&format!("调试流量日志：{}", log.path().display())),
+            None => logger("调试流量日志初始化失败（不影响转发）"),
+        }
+        log
+    } else {
+        None
+    };
+
     let ctx = Arc::new(Ctx {
         root,
         index,
         base,
         rules,
+        traffic,
     });
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
@@ -475,12 +538,12 @@ fn handle(stream: TcpStream, ctx: &Ctx, logger: fn(&str)) {
         .find(|(prefix, _)| req.path_only().starts_with(prefix.as_str()))
     {
         if is_upgrade {
-            if let Err(e) = ws_tunnel(&req, conn, upstream) {
+            if let Err(e) = ws_tunnel(&req, conn, upstream, ctx) {
                 logger(&format!("WebSocket 隧道结束 {}：{e}", req.path));
             }
             return;
         }
-        if let Err(e) = proxy(&req, &mut conn, upstream) {
+        if let Err(e) = proxy(&req, &mut conn, upstream, ctx) {
             logger(&format!("转发失败 {}：{e}", req.path));
             let _ = plain(&mut conn, 502, "Bad Gateway", &format!("上游请求失败：{e}"));
         }
@@ -724,8 +787,9 @@ fn mime_of(path: &std::path::Path) -> &'static str {
 
 // ---------------------------------------------------------------- 转发
 
-/// 组装发给上游的请求头。`keep_upgrade` 为 true 时保留升级握手所需的头。
-fn build_head(req: &Req, upstream: &Upstream, keep_upgrade: bool) -> String {
+/// 组装发给上游的请求头。`keep_upgrade` 为 true 时保留升级握手所需的头；
+/// `keep_alive` 为 true 时告知上游可复用连接（池化请求）。
+fn build_head(req: &Req, upstream: &Upstream, keep_upgrade: bool, keep_alive: bool) -> String {
     let host_header = if (upstream.tls && upstream.port == 443)
         || (!upstream.tls && upstream.port == 80)
     {
@@ -769,17 +833,107 @@ fn build_head(req: &Req, upstream: &Upstream, keep_upgrade: bool) -> String {
         head.push_str(&format!("{name}: {value}\r\n"));
     }
     if !keep_upgrade {
-        head.push_str("Connection: close\r\n");
+        head.push_str(if keep_alive {
+            "Connection: keep-alive\r\n"
+        } else {
+            "Connection: close\r\n"
+        });
     }
     head.push_str("\r\n");
     head
 }
 
-fn proxy(req: &Req, conn: &mut Conn<TcpStream>, upstream: &Upstream) -> Result<(), String> {
-    let mut up = Conn::new(connect(upstream)?);
-    let head = build_head(req, upstream, false);
+/// 一次交换失败时，是否已经把响应头回写给客户端（决定能否重放请求）。
+struct ExchangeError {
+    message: String,
+    responded: bool,
+}
+
+impl ExchangeError {
+    fn before_response(message: String) -> Self {
+        Self {
+            message,
+            responded: false,
+        }
+    }
+
+    fn after_response(message: String) -> Self {
+        Self {
+            message,
+            responded: true,
+        }
+    }
+}
+
+struct ExchangeOk {
+    status: u16,
+    /// None 表示分块编码，未统计精确字节数
+    body_bytes: Option<u64>,
+    reusable: bool,
+}
+
+fn proxy(
+    req: &Req,
+    conn: &mut Conn<TcpStream>,
+    upstream: &Upstream,
+    ctx: &Ctx,
+) -> Result<(), String> {
+    let has_body = req
+        .header("transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false)
+        || req
+            .header("content-length")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|len| len > 0)
+            .unwrap_or(false);
+    // 只有「幂等且无 body」的请求才复用池中连接，并在复用连接失效时重试一次；
+    // 其余请求一律新建连接，避免无 body 的 POST 被重放出重复提交。
+    let idempotent = !has_body && is_idempotent(&req.method);
+    let mut attempt = 0u8;
+    loop {
+        let started = Instant::now();
+        let (mut up, reused) = match take_idle(upstream, idempotent) {
+            Some(io) => (Conn::new(io), true),
+            None => (Conn::new(connect(upstream)?), false),
+        };
+        match exchange(req, conn, upstream, &mut up, idempotent) {
+            Ok(done) => {
+                ctx.log_http(req, upstream, done.status, started.elapsed(), done.body_bytes);
+                if idempotent && done.reusable {
+                    return_idle(upstream, up);
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                if err.responded || !reused || !idempotent || attempt >= 1 {
+                    if !err.responded {
+                        ctx.log_http(req, upstream, 502, started.elapsed(), None);
+                    }
+                    return Err(err.message);
+                }
+                attempt += 1;
+                ctx.traffic_line(&format!(
+                    "HTTP 复用连接失效，重试：{}（{}）",
+                    safe_path(&req.path),
+                    err.message
+                ));
+            }
+        }
+    }
+}
+
+/// 一次完整的请求-响应交换：发请求头/体，回写响应头与响应体。
+fn exchange(
+    req: &Req,
+    conn: &mut Conn<TcpStream>,
+    upstream: &Upstream,
+    up: &mut Conn<Io>,
+    keep_alive: bool,
+) -> Result<ExchangeOk, ExchangeError> {
+    let head = build_head(req, upstream, false, keep_alive);
     up.send(head.as_bytes())
-        .map_err(|e| format!("写入上游失败：{e}"))?;
+        .map_err(|e| ExchangeError::before_response(format!("写入上游失败：{e}")))?;
 
     // 客户端要 100-continue 时由本地服务自己应答，否则它会等不到继续响应而不发 body
     let expect_continue = req
@@ -787,8 +941,9 @@ fn proxy(req: &Req, conn: &mut Conn<TcpStream>, upstream: &Upstream) -> Result<(
         .map(|v| v.to_ascii_lowercase().contains("100-continue"))
         .unwrap_or(false);
     if expect_continue {
-        conn.send(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .map_err(|e| format!("回写 100 Continue 失败：{e}"))?;
+        conn.send(b"HTTP/1.1 100 Continue\r\n\r\n").map_err(|e| {
+            ExchangeError::before_response(format!("回写 100 Continue 失败：{e}"))
+        })?;
     }
 
     // 请求 body：按框架原样透传，支持 JSON、multipart、分块上传
@@ -797,20 +952,23 @@ fn proxy(req: &Req, conn: &mut Conn<TcpStream>, upstream: &Upstream) -> Result<(
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false);
     if chunked_request {
-        conn.copy_chunked(&mut up)
-            .map_err(|e| format!("转发请求体失败：{e}"))?;
+        conn.copy_chunked(up)
+            .map_err(|e| ExchangeError::before_response(format!("转发请求体失败：{e}")))?;
     } else if let Some(len) = req
         .header("content-length")
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
-        conn.copy_exact(len, &mut up)
-            .map_err(|e| format!("转发请求体失败：{e}"))?;
+        conn.copy_exact(len, up)
+            .map_err(|e| ExchangeError::before_response(format!("转发请求体失败：{e}")))?;
     }
     up.flush().ok();
 
     // 响应头
-    let resp_head = up.read_head().map_err(|e| format!("读取上游响应失败：{e}"))?;
-    let resp = Resp::parse(&resp_head).ok_or("上游响应无法解析")?;
+    let resp_head = up
+        .read_head()
+        .map_err(|e| ExchangeError::before_response(format!("读取上游响应失败：{e}")))?;
+    let resp = Resp::parse(&resp_head)
+        .ok_or_else(|| ExchangeError::before_response("上游响应无法解析".to_string()))?;
     let mut out = format!("HTTP/1.1 {} X\r\n", resp.status);
     for (name, value) in &resp.headers {
         if name.eq_ignore_ascii_case("connection")
@@ -826,25 +984,95 @@ fn proxy(req: &Req, conn: &mut Conn<TcpStream>, upstream: &Upstream) -> Result<(
     }
     out.push_str("Connection: close\r\n\r\n");
     conn.send(out.as_bytes())
-        .map_err(|e| format!("回写响应头失败：{e}"))?;
+        .map_err(|e| ExchangeError::after_response(format!("回写响应头失败：{e}")))?;
 
-    if !resp.has_body() {
-        return Ok(());
-    }
-    if resp.is_chunked() {
+    let body_bytes = if !resp.has_body() {
+        Some(0)
+    } else if resp.is_chunked() {
         up.copy_chunked(conn)
-            .map_err(|e| format!("转发响应体失败：{e}"))?;
+            .map_err(|e| ExchangeError::after_response(format!("转发响应体失败：{e}")))?;
+        None
     } else if let Some(len) = resp
         .header("content-length")
         .and_then(|v| v.trim().parse::<u64>().ok())
     {
-        up.copy_exact(len, conn)
-            .map_err(|e| format!("转发响应体失败：{e}"))?;
+        Some(
+            up.copy_exact(len, conn)
+                .map_err(|e| ExchangeError::after_response(format!("转发响应体失败：{e}")))?,
+        )
     } else {
-        up.copy_until_eof(conn)
-            .map_err(|e| format!("转发响应体失败：{e}"))?;
+        Some(
+            up.copy_until_eof(conn)
+                .map_err(|e| ExchangeError::after_response(format!("转发响应体失败：{e}")))?,
+        )
+    };
+    Ok(ExchangeOk {
+        status: resp.status,
+        body_bytes,
+        reusable: can_reuse(&resp, up.pending()),
+    })
+}
+
+/// 响应读完、上游没有要求关闭、且缓冲无残留时才把连接放回池里。
+fn can_reuse(resp: &Resp, pending: usize) -> bool {
+    if resp.status < 200 || resp.status == 101 || pending != 0 {
+        return false;
     }
-    Ok(())
+    if let Some(connection) = resp.header("connection") {
+        if connection.to_ascii_lowercase().contains("close") {
+            return false;
+        }
+    }
+    resp.is_chunked() || resp.header("content-length").is_some() || !resp.has_body()
+}
+
+fn is_idempotent(method: &str) -> bool {
+    method.eq_ignore_ascii_case("GET")
+        || method.eq_ignore_ascii_case("HEAD")
+        || method.eq_ignore_ascii_case("OPTIONS")
+}
+
+fn take_idle(upstream: &Upstream, allow_reuse: bool) -> Option<Io> {
+    if !allow_reuse {
+        return None;
+    }
+    let mut pool = upstream.idle.lock().ok()?;
+    while let Some(mut io) = pool.pop() {
+        if io_usable(&mut io) {
+            return Some(io);
+        }
+    }
+    None
+}
+
+fn return_idle(upstream: &Upstream, up: Conn<Io>) {
+    let (io, pending) = up.into_parts();
+    if !pending.is_empty() || io.set_read_timeout(Some(IO_TIMEOUT)).is_err() {
+        return;
+    }
+    if let Ok(mut pool) = upstream.idle.lock() {
+        if pool.len() < MAX_IDLE_PER_RULE {
+            pool.push(io);
+        }
+    }
+}
+
+/// 池中连接是否还能用：已关闭、有残留字节都直接丢弃。
+fn io_usable(io: &mut Io) -> bool {
+    if io.set_read_timeout(Some(Duration::from_millis(1))).is_err() {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    let usable = match io.read(&mut probe) {
+        Ok(0) => false,
+        Ok(_) => false,
+        Err(e) => matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ),
+    };
+    let _ = io.set_read_timeout(Some(IO_TIMEOUT));
+    usable
 }
 
 // ---------------------------------------------------------------- WebSocket 隧道
@@ -859,11 +1087,16 @@ fn retryable(err: &io::Error) -> bool {
 /// WebSocket 转发：改写信手头后建立隧道，之后按原始字节双向搬运。
 ///
 /// 上游是 TLS 时无法把连接拆给两个线程，所以用「短读超时 + 单线程轮询」实现双向搬运。
-fn ws_tunnel(req: &Req, conn: Conn<TcpStream>, upstream: &Upstream) -> Result<(), String> {
+fn ws_tunnel(
+    req: &Req,
+    conn: Conn<TcpStream>,
+    upstream: &Upstream,
+    ctx: &Ctx,
+) -> Result<(), String> {
     let (mut client, client_pending) = conn.into_parts();
     let mut up = Conn::new(connect(upstream)?);
 
-    let head = build_head(req, upstream, true);
+    let head = build_head(req, upstream, true, false);
     up.send(head.as_bytes())
         .map_err(|e| format!("写入握手请求失败：{e}"))?;
 
@@ -876,8 +1109,21 @@ fn ws_tunnel(req: &Req, conn: Conn<TcpStream>, upstream: &Upstream) -> Result<()
         .map_err(|e| format!("回写握手响应失败：{e}"))?;
     client.flush().ok();
     if resp.status != 101 {
+        ctx.traffic_line(&format!(
+            "WS 握手失败 {} -> {}:{} status={}",
+            safe_path(&req.path),
+            upstream.host,
+            upstream.port,
+            resp.status
+        ));
         return Ok(());
     }
+    ctx.traffic_line(&format!(
+        "WS 握手成功 {} -> {}:{}",
+        safe_path(&req.path),
+        upstream.host,
+        upstream.port
+    ));
 
     let (mut up_io, up_pending) = up.into_parts();
     if !up_pending.is_empty() {
@@ -907,30 +1153,57 @@ fn ws_tunnel(req: &Req, conn: Conn<TcpStream>, upstream: &Upstream) -> Result<()
 
     let mut client_buf = vec![0u8; 16 * 1024];
     let mut up_buf = vec![0u8; 16 * 1024];
-    loop {
-        match client.read(&mut client_buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => {
-                up_io
-                    .write_all(&client_buf[..n])
-                    .map_err(|e| format!("隧道上行写入失败：{e}"))?;
-                up_io.flush().ok();
+    let mut uplink_bytes = 0u64;
+    let mut downlink_bytes = 0u64;
+    // 双向共享的最后收包时间：单侧静音（长下载 / 只说不听）不算死连接
+    let mut last_activity = Instant::now();
+    let outcome = (|| -> Result<(), String> {
+        loop {
+            match client.read(&mut client_buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    uplink_bytes += n as u64;
+                    last_activity = Instant::now();
+                    up_io
+                        .write_all(&client_buf[..n])
+                        .map_err(|e| format!("隧道上行写入失败：{e}"))?;
+                    up_io.flush().ok();
+                }
+                Err(e) if retryable(&e) => {}
+                Err(e) => return Err(format!("隧道上行读取失败：{e}")),
             }
-            Err(e) if retryable(&e) => {}
-            Err(e) => return Err(format!("隧道上行读取失败：{e}")),
-        }
-        match up_io.read(&mut up_buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => {
-                client
-                    .write_all(&up_buf[..n])
-                    .map_err(|e| format!("隧道下行写入失败：{e}"))?;
-                client.flush().ok();
+            match up_io.read(&mut up_buf) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    downlink_bytes += n as u64;
+                    last_activity = Instant::now();
+                    client
+                        .write_all(&up_buf[..n])
+                        .map_err(|e| format!("隧道下行写入失败：{e}"))?;
+                    client.flush().ok();
+                }
+                Err(e) if retryable(&e) => {}
+                Err(e) => return Err(format!("隧道下行读取失败：{e}")),
             }
-            Err(e) if retryable(&e) => {}
-            Err(e) => return Err(format!("隧道下行读取失败：{e}")),
+            if last_activity.elapsed() >= WS_IDLE_TIMEOUT {
+                return Err(format!(
+                    "双向静默超过 {}s，回收隧道",
+                    WS_IDLE_TIMEOUT.as_secs()
+                ));
+            }
         }
-    }
+    })();
+    ctx.traffic_line(&format!(
+        "WS 隧道结束 {} 上行 {}B 下行 {}B{}",
+        safe_path(&req.path),
+        uplink_bytes,
+        downlink_bytes,
+        match &outcome {
+            Ok(_) => String::new(),
+            Err(e) => format!("（{e}）"),
+        }
+    ));
+    outcome
 }
 
 enum Io {
@@ -1141,6 +1414,7 @@ fn parse_upstream(target: &str, rule: &Rule) -> Result<Upstream, String> {
         insecure: rule.insecure,
         resolve_ip: rule.resolve_ip.trim().to_string(),
         extra_headers: parse_extra_headers(&rule.headers),
+        idle: Mutex::new(Vec::new()),
     })
 }
 
@@ -1168,4 +1442,100 @@ fn parse_extra_headers(text: &str) -> Vec<(String, String)> {
             Vec::new()
         }
     }
+}
+
+// ---------------------------------------------------------------- 调试流量日志
+
+/// 调试流量日志：只在 `debugLog` 显式开启时创建，写到 `%TEMP%\jianling-logs`。
+/// 写失败只影响日志本身，转发不受影响。
+struct TrafficLog {
+    path: PathBuf,
+    file: Mutex<io::BufWriter<std::fs::File>>,
+}
+
+impl TrafficLog {
+    fn create() -> Option<Self> {
+        let dir = std::env::temp_dir().join("jianling-logs");
+        std::fs::create_dir_all(&dir).ok()?;
+        let (stamp, _) = local_now();
+        let path = dir.join(format!("traffic-{stamp}.log"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
+        let log = Self {
+            path,
+            file: Mutex::new(io::BufWriter::new(file)),
+        };
+        log.line("会话开始（Windows 本地服务）");
+        Some(log)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn line(&self, text: &str) {
+        let Ok(mut file) = self.file.lock() else {
+            return;
+        };
+        let (_, time) = local_now();
+        let _ = writeln!(file, "{time} {text}");
+        let _ = file.flush();
+    }
+}
+
+/// 本地时间：(yyyyMMdd-HHmmss-SSS, HH:mm:ss.SSS)
+#[cfg(windows)]
+fn local_now() -> (String, String) {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+
+    let st = unsafe { GetLocalTime() };
+    (
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+        ),
+        format!(
+            "{:02}:{:02}:{:02}.{:03}",
+            st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+        ),
+    )
+}
+
+#[cfg(not(windows))]
+fn local_now() -> (String, String) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let stamp = millis.to_string();
+    (stamp.clone(), stamp)
+}
+
+/// URL 里的 token/ticket 等参数脱敏后再落日志。
+fn safe_path(path: &str) -> String {
+    let Some((head, query)) = path.split_once('?') else {
+        return path.to_string();
+    };
+    let masked: Vec<String> = query
+        .split('&')
+        .map(|pair| {
+            let (key, _) = pair.split_once('=').unwrap_or((pair, ""));
+            let lower = key.to_ascii_lowercase();
+            if lower.contains("token")
+                || lower.contains("ticket")
+                || lower.contains("key")
+                || lower.contains("secret")
+            {
+                format!("{key}=***")
+            } else {
+                pair.to_string()
+            }
+        })
+        .collect();
+    format!("{head}?{}", masked.join("&"))
 }

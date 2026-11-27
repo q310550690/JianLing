@@ -391,6 +391,9 @@ public class MainActivity extends AppCompatActivity {
     // ========================================================================
     // 全屏沉浸式（VIA 默认也是沉浸式全屏，不显示系统栏）
     // ========================================================================
+    // 沉浸式全屏仍要兼容 Android 10 以下的 legacy flag；setSystemUiVisibility /
+    // SYSTEM_UI_FLAG_* 在 API 30 标记弃用，这里按需保留并抑制提示。
+    @SuppressWarnings("deprecation")
     private void setupFullScreen() {
         try {
             Window window = getWindow();
@@ -948,6 +951,9 @@ public class MainActivity extends AppCompatActivity {
                 if (usePushed) {
                     Log.i(TAG, "使用外部推送资源: "
                             + new File(pushedRoot, RESOURCE_DIR).getAbsolutePath());
+                    // 热推目录随时会被整体替换：即便项目配置了「缓存优先」也要绕开
+                    // WebView 磁盘缓存，否则重新推送后冷启动仍加载旧 JS/CSS。
+                    settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
                 }
                 // 优先启用内置本地服务：页面与 /api、/ws 同源，免 CORS、免改前端 base。
                 // 启动失败（例如没写配置）时退回 WebViewAssetLoader。
@@ -1637,6 +1643,9 @@ public class MainActivity extends AppCompatActivity {
     }
 
     /** 把页面回传的 base64 写成文件：Android 10+ 走 MediaStore.Downloads（无需存储权限）。 */
+    // Android 10+ 走 MediaStore.Downloads（无需存储权限）；公共 Downloads 目录
+    // 仅在更老的系统上使用，getExternalStoragePublicDirectory 已被标记弃用。
+    @SuppressWarnings("deprecation")
     private String _saveBase64ToDownloads(String fileName, String mimetype, String base64) {
         try {
             byte[] bytes = Base64.decode(base64 == null ? "" : base64, Base64.DEFAULT);
@@ -2096,7 +2105,12 @@ public class MainActivity extends AppCompatActivity {
                         String encoding = mime.startsWith("text/")
                                 || mime.contains("javascript")
                                 || mime.contains("json") ? "UTF-8" : null;
-                        return new WebResourceResponse(mime, encoding, new FileInputStream(file));
+                        WebResourceResponse response =
+                                new WebResourceResponse(mime, encoding, new FileInputStream(file));
+                        // 外部热推目录随时被整体替换，禁用缓存避免命中旧文件
+                        response.setResponseHeaders(
+                                Collections.singletonMap("Cache-Control", "no-store"));
+                        return response;
                     }
                 } catch (Exception ignored) {
                     // 读不到就走 assets

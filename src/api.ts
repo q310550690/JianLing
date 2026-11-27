@@ -146,11 +146,19 @@ export interface BuildRecord {
   durationSecs: number;
   createdAt: number;
   logPath: string;
-  platform: "android" | "windows";
+  platform: "android" | "windows" | "macos" | "linux" | "harmony" | "ios";
   /** 构建是否失败；旧记录没有该字段，缺省视为成功 */
   failed: boolean;
   /** 失败原因 */
   error: string;
+  /** 该次构建的全部产物文件（Windows 可能同时有单文件/安装包/绿色版；旧记录没有） */
+  artifacts?: string[];
+}
+
+/** 判断产物是否调试包（兼容旧名 xxx-debug.apk 与新名 xxx-debug-时间戳.apk） */
+export function isDebugApkPath(path: string): boolean {
+  const name = path.split(/[\\/]/).pop() ?? "";
+  return /-debug(\.|-)/i.test(name);
 }
 
 export interface SplashConfig {
@@ -196,6 +204,8 @@ export interface LocalServerConfig {
   port: number;
   /** 部署目录：站点挂在域名子目录时填 /h5/，根目录用 / */
   basePath: string;
+  /** 调试流量日志：只在调试包里生效，正式包一律不开启 */
+  debugLog: boolean;
   proxies: ProxyRule[];
 }
 
@@ -212,6 +222,7 @@ export const DEFAULT_LOCAL_SERVER: LocalServerConfig = {
   enabled: false,
   port: 0,
   basePath: "/",
+  debugLog: false,
   proxies: [{ ...DEFAULT_PROXY_RULE }],
 };
 
@@ -350,7 +361,7 @@ export const DEFAULT_WINDOWS: WindowsProfile = {
   closeMode: "exit",
   zoom: 1,
   autoplay: true,
-  blockContextMenu: false,
+  blockContextMenu: true,
   blockTextSelect: false,
   hideScrollbars: true,
   blockCtrlZoom: false,
@@ -388,10 +399,24 @@ export interface Project {
   target: string;
   android: AndroidProfile;
   windows: WindowsProfile;
+  /** macOS 专属字段；窗口、本地服务等其余配置复用 windows */
+  macos: MacosProfile;
   createdAt: number;
   updatedAt: number;
   builds: BuildRecord[];
 }
+
+export interface MacosProfile {
+  /** CFBundleIdentifier，留空时按包名或应用名生成 */
+  bundleId: string;
+  /** codesign 签名身份，留空输出未签名 .app */
+  signIdentity: string;
+}
+
+export const DEFAULT_MACOS: MacosProfile = {
+  bundleId: "",
+  signIdentity: "",
+};
 
 export interface Settings {
   jdkPath: string | null;
@@ -517,6 +542,11 @@ export function deleteWindowsKernel(id: string, path: string) {
   return invoke<void>("delete_windows_kernel", { id, path });
 }
 
+/** Windows 内核（WebView2 固定版本运行时）的存放目录 */
+export function windowsKernelDir() {
+  return invoke<string>("windows_kernel_dir");
+}
+
 export function checkEnvironment(settings: Partial<Settings> = {}) {
   return invoke<EnvReport>("check_environment", {
     jdkPath: settings.jdkPath ?? null,
@@ -535,6 +565,16 @@ export function saveSettings(settings: Settings) {
 /** 读取构建日志文件内容（供历史记录在弹窗中查看） */
 export function readBuildLog(path: string) {
   return invoke<string>("read_build_log", { path });
+}
+
+/** Windows 壳调试流量日志的落盘目录（系统临时目录下） */
+export function trafficLogDir() {
+  return invoke<string>("traffic_log_dir");
+}
+
+/** 删除构建记录关联的产物文件，返回实际删除的路径列表 */
+export function deleteBuildFiles(paths: string[]) {
+  return invoke<string[]>("delete_build_files", { paths });
 }
 
 export interface AdbDevice {
@@ -598,6 +638,11 @@ export function adbInstalledPackages(serial: string, packages: string[]) {
   return invoke<string[]>("adb_installed_packages", { serial, packages });
 }
 
+/** 把调试包写在设备上的流量日志拉到本机临时目录，返回落盘目录 */
+export function adbPullLogs(serial: string, packageName: string) {
+  return invoke<string>("adb_pull_logs", { serial, package: packageName });
+}
+
 export interface DevtoolsInfo {
   port: number;
   targetId: string;
@@ -649,6 +694,8 @@ export interface WindowsBuildRequest {
   projectId: string;
   appName: string;
   versionName: string;
+  /** 包名（仅用于产物命名，留空时退回应用名） */
+  packageName: string;
   outputDir: string | null;
   sourceKind: string;
   startUrl: string;
@@ -704,11 +751,79 @@ export interface WindowsBuildRequest {
   certPassword: string | null;
   /** 自带内核目录，null = 跟随系统 */
   kernelPath: string | null;
+  /** macOS 专用：Bundle Identifier，null 时按包名/应用名生成 */
+  bundleId?: string | null;
+  /** macOS 专用：codesign 签名身份，null 不签名 */
+  signIdentity?: string | null;
 }
 
 /** 导出 Windows 桌面套壳：exe + www + shell.json 的免安装目录。 */
 export function buildWindows(request: WindowsBuildRequest) {
   return invoke<WindowsBuildResult>("build_windows", { request });
+}
+
+export interface MacosBuildResult {
+  buildId: string;
+  dir: string;
+  /** .app 目录 */
+  appPath: string;
+  zipPath: string | null;
+  sizeBytes: number;
+  signed: boolean;
+  durationSecs: number;
+  logPath: string;
+}
+
+/** 导出 macOS 套壳：.app + zip（签名与 icns 需要 macOS 环境）。 */
+export function buildMacos(request: WindowsBuildRequest) {
+  return invoke<MacosBuildResult>("build_macos", { request });
+}
+
+export interface LinuxBuildResult {
+  buildId: string;
+  dir: string;
+  exePath: string;
+  zipPath: string | null;
+  sizeBytes: number;
+  durationSecs: number;
+  logPath: string;
+}
+
+/** 导出 Linux 套壳：可执行文件 + www + shell.json + run.sh + zip。 */
+export function buildLinux(request: WindowsBuildRequest) {
+  return invoke<LinuxBuildResult>("build_linux", { request });
+}
+
+export interface HarmonyBuildResult {
+  buildId: string;
+  dir: string;
+  projectPath: string;
+  zipPath: string | null;
+  sizeBytes: number;
+  durationSecs: number;
+  logPath: string;
+}
+
+/** 生成 HarmonyOS NEXT 工程（ArkTS + ArkWeb），构建 HAP 需要 DevEco Studio。 */
+export function buildHarmony(request: WindowsBuildRequest) {
+  return invoke<HarmonyBuildResult>("build_harmony", { request });
+}
+
+export interface IosBuildResult {
+  buildId: string;
+  dir: string;
+  projectPath: string;
+  /** 装了 xcodegen 时会给出 .xcodeproj 路径 */
+  xcodeproj: string | null;
+  zipPath: string | null;
+  sizeBytes: number;
+  durationSecs: number;
+  logPath: string;
+}
+
+/** 生成 iOS 工程（Swift + WKWebView），签名与 ipa 导出需要在 macOS 上用 Xcode 完成。 */
+export function buildIos(request: WindowsBuildRequest) {
+  return invoke<IosBuildResult>("build_ios", { request });
 }
 
 /** 下载并安装 JDK 21；targetDir 为空时装到应用数据目录。 */
@@ -742,6 +857,7 @@ export function newProject(name?: string): Project {
         proxies: [{ ...DEFAULT_PROXY_RULE }],
       },
     },
+    macos: { ...DEFAULT_MACOS },
     createdAt: now,
     updatedAt: now,
     builds: [],

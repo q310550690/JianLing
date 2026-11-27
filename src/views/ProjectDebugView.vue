@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { ArrowLeft } from "@element-plus/icons-vue";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   adbDevices,
   adbInstallApk,
@@ -11,11 +12,13 @@ import {
   adbLaunchApp,
   adbLogcatClear,
   adbLogcatTail,
+  adbPullLogs,
   adbPushWww,
   adbWebviewVersion,
   copyToClipboard,
   devtoolsConnect,
   devtoolsDisconnect,
+  isDebugApkPath,
   loadSettings,
   type AdbDevice,
   type BuildRecord,
@@ -25,6 +28,14 @@ import {
 
 const props = defineProps<{ projectId: string }>();
 const router = useRouter();
+const route = useRoute();
+
+/** 入口指定的目标包（构建调试包 / 历史「调试」按钮会带 target=debug） */
+const forcedTarget = computed<"release" | "debug" | "">(() => {
+  const target = route.query.target;
+  return target === "debug" || target === "release" ? target : "";
+});
+let targetApplied = false;
 
 const settings = ref<Settings | null>(null);
 const devices = ref<AdbDevice[]>([]);
@@ -70,7 +81,7 @@ const canPush = computed(
 
 const debugApk = computed<BuildRecord | null>(() => {
   const list = (project.value?.builds ?? []).filter(
-    (b) => b.platform === "android" && !b.failed && b.apkPath.endsWith("-debug.apk"),
+    (b) => b.platform === "android" && !b.failed && isDebugApkPath(b.apkPath),
   );
   if (!list.length) return null;
   return list.reduce((a, b) => (b.createdAt > a.createdAt ? b : a));
@@ -98,6 +109,14 @@ async function detectInstalled() {
   } catch {
     // 探测失败不影响其它步骤，交给按钮状态提示
     installed.value = [];
+  }
+  // 入口指定了目标包（构建完调试包跳过来）就优先用它，不再按已装情况猜测
+  if (!targetApplied) {
+    targetApplied = true;
+    if (forcedTarget.value) {
+      target.value = forcedTarget.value;
+      return;
+    }
   }
   // 只装了一个就选它；两个都装时保持用户选择
   const hasRelease = installed.value.includes(basePackage.value);
@@ -197,15 +216,15 @@ async function launch() {
 /** 把前端 dist 推到设备（files/www），省去重新打包 APK；应用重启后生效 */
 async function pushDist() {
   if (!selected.value || !targetPackage.value || !distDir.value) return;
+  if (!targetInstalled.value) {
+    ElMessage.warning(`设备上没有安装 ${targetPackage.value}，先安装再推送`);
+    return;
+  }
   pushing.value = true;
   try {
     await adbPushWww(selected.value, targetPackage.value, distDir.value);
-    if (targetInstalled.value) {
-      await adbLaunchApp(selected.value, targetPackage.value);
-      ElMessage.success("资源已推送，应用已重启");
-    } else {
-      ElMessage.warning("资源已推送；设备上还没装这个包，装好后再启动即可");
-    }
+    await adbLaunchApp(selected.value, targetPackage.value);
+    ElMessage.success(`已推送到 ${targetPackage.value} 并重启`);
     await pullLogs();
   } catch (e) {
     ElMessage.error(String(e));
@@ -329,6 +348,38 @@ function goBack() {
   router.push({ name: "project", params: { id: props.projectId } });
 }
 
+/** 项目配置里是否勾了「调试流量日志」（本地服务未启用时日志也不会产生） */
+const trafficLogEnabled = computed(() => {
+  const cfg = android.value?.localServer;
+  return !!cfg?.enabled && !!cfg.debugLog;
+});
+const pullingLogs = ref(false);
+
+async function pullTrafficLogs() {
+  if (!current.value) {
+    ElMessage.warning("先在上面选一台设备");
+    return;
+  }
+  if (target.value !== "debug") {
+    ElMessage.warning("流量日志只写在调试包里，先把目标包切到调试包");
+    return;
+  }
+  if (!debugPackage.value) {
+    ElMessage.warning("项目还没配置包名");
+    return;
+  }
+  pullingLogs.value = true;
+  try {
+    const dir = await adbPullLogs(selected.value, debugPackage.value);
+    ElMessage.success("流量日志已拉到本机");
+    await revealItemInDir(dir);
+  } catch (e) {
+    ElMessage.error(String(e));
+  } finally {
+    pullingLogs.value = false;
+  }
+}
+
 onMounted(async () => {
   await loadConfig();
   await refreshDevices();
@@ -355,7 +406,10 @@ onUnmounted(() => {
       </button>
       <div class="head-title">
         <h1 class="title">设备调试 · {{ appName || "未命名项目" }}</h1>
-        <p class="subtitle">{{ targetPackage || "未配置包名" }}</p>
+        <p class="subtitle">
+          <span class="pkg-chip" :class="target">{{ target === "debug" ? "调试包" : "正式包" }}</span>
+          {{ targetPackage || "未配置包名" }}
+        </p>
       </div>
       <div class="head-actions">
         <el-button
@@ -365,7 +419,7 @@ onUnmounted(() => {
           :loading="pushing"
           @click="pushDist"
         >
-          重新推送资源
+          {{ target === "debug" ? "重新推送到调试包" : "重新推送到正式包" }}
         </el-button>
       </div>
     </header>
@@ -466,7 +520,7 @@ onUnmounted(() => {
           <div class="card-title">安装并启动</div>
           <div class="actions">
             <el-button
-              v-if="debugApk"
+              v-if="debugApk && target === 'debug'"
               type="primary"
               :disabled="!current"
               :loading="installing"
@@ -557,6 +611,39 @@ onUnmounted(() => {
           </div>
         </div>
       </section>
+
+      <section class="card">
+        <div class="step">6</div>
+        <div class="card-main">
+          <div class="card-head">
+            <span class="card-title">流量日志</span>
+            <span class="pack-state" :class="{ ok: trafficLogEnabled }">
+              {{ trafficLogEnabled ? "已开启" : "未开启" }}
+            </span>
+          </div>
+          <div class="actions">
+            <el-button
+              type="primary"
+              :disabled="!current || target !== 'debug' || !trafficLogEnabled"
+              :loading="pullingLogs"
+              @click="pullTrafficLogs"
+            >
+              {{ pullingLogs ? "拉取中…" : "拉取到本机并打开" }}
+            </el-button>
+          </div>
+          <div v-if="!trafficLogEnabled" class="empty">
+            先在项目页开启调试流量日志，再重新打调试包。
+          </div>
+          <div v-else-if="target !== 'debug'" class="empty">
+            日志只在调试包里，把目标包切到调试包。
+          </div>
+          <p class="hint">
+            日志在设备的
+            <code>Android/data/{{ debugPackage }}/files/jianling-logs/</code>，
+            包含请求记录和上下行音频。正式包不写日志。
+          </p>
+        </div>
+      </section>
     </el-scrollbar>
   </div>
 </template>
@@ -616,6 +703,21 @@ onUnmounted(() => {
   font-size: 11.5px;
   color: var(--text-faint);
   word-break: break-all;
+}
+
+.pkg-chip {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.pkg-chip.release {
+  background: #5b6b7c;
 }
 
 .page-body {

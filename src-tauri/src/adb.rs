@@ -170,6 +170,36 @@ pub fn adb_install_apk(app: AppHandle, serial: String, path: String) -> Result<S
 #[tauri::command]
 pub fn adb_launch_app(app: AppHandle, serial: String, package: String) -> Result<(), String> {
     let adb = adb_for(&app)?;
+    // 先拿 launcher activity 再 am start -W：monkey 找不到入口时也返回 0，
+    // 会出现「提示已重启但页面根本没起来」的假成功。
+    if let Ok(out) = run(
+        &adb,
+        &[
+            "-s",
+            &serial,
+            "shell",
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            &package,
+        ],
+    ) {
+        let component = out
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains('/') && !line.starts_with("priority="))
+            .last()
+            .unwrap_or("")
+            .to_string();
+        if !component.is_empty() {
+            run(
+                &adb,
+                &["-s", &serial, "shell", "am", "start", "-W", "-n", &component],
+            )?;
+            return Ok(());
+        }
+    }
     run(
         &adb,
         &[
@@ -223,6 +253,17 @@ pub fn adb_push_www(
     if !dir.join("index.html").is_file() {
         return Err(format!("前端 dist 里没有 index.html：{}", dir.display()));
     }
+    // 目标包没装时 directory 推上去也没人读，还容易被误认为成功
+    let packages = run(
+        &adb,
+        &["-s", &serial, "shell", "pm", "list", "packages", &package],
+    )?;
+    let needle = format!("package:{package}");
+    if !packages.lines().any(|line| line.trim() == needle) {
+        return Err(format!(
+            "设备上没有安装 {package}：先安装当前选中的包，再重新推送"
+        ));
+    }
     // 先停掉应用，避免它一边读文件一边被替换
     let _ = run(&adb, &["-s", &serial, "shell", "am", "force-stop", &package]);
     let parent = format!("/sdcard/Android/data/{package}/files");
@@ -233,7 +274,39 @@ pub fn adb_push_www(
         &adb,
         &["-s", &serial, "push", &dir.to_string_lossy(), &remote],
     )?;
+    // 校验 index.html 真的落在 www 根目录：adb 版本差异可能推成 www/dist/...
+    let probe = format!("{remote}/index.html");
+    let listed = run(&adb, &["-s", &serial, "shell", "ls", &probe]).unwrap_or_default();
+    if !listed.contains("index.html") {
+        return Err(format!(
+            "推送完成但远端没有 {probe}：检查设备剩余空间与 Android/data 访问权限"
+        ));
+    }
     Ok(out.trim().to_string())
+}
+
+/// 把调试包写在设备外部目录的流量日志拉到本机临时目录，返回落盘目录。
+#[tauri::command]
+pub fn adb_pull_logs(app: AppHandle, serial: String, package: String) -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let adb = adb_for(&app)?;
+    let remote = format!("/sdcard/Android/data/{package}/files/jianling-logs");
+    run(&adb, &["-s", &serial, "shell", "ls", &remote]).map_err(|_| {
+        "设备上还没有流量日志：确认装的是调试包，且项目配置里开启了「调试流量日志」".to_string()
+    })?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let base = std::env::temp_dir().join("jianling-logs");
+    std::fs::create_dir_all(&base).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    let dest = base.join(format!("{package}-{stamp}"));
+    run(
+        &adb,
+        &["-s", &serial, "pull", &remote, &dest.to_string_lossy()],
+    )?;
+    Ok(dest.to_string_lossy().to_string())
 }
 
 /// 锁屏会让页面 visible:false，CDP 部分域被节流（看着像卡死）；这里一键常亮。

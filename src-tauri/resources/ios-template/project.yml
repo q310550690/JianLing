@@ -1,0 +1,24 @@
+name: __TARGET_NAME__
+options:
+  bundleIdPrefix: com.jianling
+  deploymentTarget:
+    iOS: "14.0"
+targets:
+  __TARGET_NAME__:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      - path: Resources
+        type: folder
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: __BUNDLE_ID__
+        PRODUCT_NAME: __TARGET_NAME__
+        MARKETING_VERSION: "__VERSION__"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Automatic

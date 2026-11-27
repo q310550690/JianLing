@@ -3,8 +3,9 @@ import { computed, inject, onMounted, onUnmounted, ref } from "vue";
 import { ElMessage } from "element-plus";
 import { Refresh } from "@element-plus/icons-vue";
 import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { checkEnvironment, deleteWindowsKernel, downloadWindowsKernel, fetchWindowsKernelVersions, importWindowsKernel, installJdk, installSdk, loadSettings, saveSettings } from "../api";
+import { checkEnvironment, deleteWindowsKernel, downloadWindowsKernel, fetchWindowsKernelVersions, importWindowsKernel, installJdk, installSdk, loadSettings, saveSettings, windowsKernelDir } from "../api";
 import type { InstallProgress, KernelProgress, KernelVersion, Settings, WindowsKernel } from "../api";
 import type { EnvReport, EnvStatus } from "../types";
 
@@ -37,7 +38,25 @@ const versions = ref<KernelVersion[]>([]);
 const versionLoading = ref(false);
 const selectedVersion = ref("");
 const kernelJob = ref({ running: false, percent: 0, message: "" });
+const kernelDir = ref("");
 let unlistenKernel: UnlistenFn | null = null;
+
+async function loadKernelDir() {
+  try {
+    kernelDir.value = await windowsKernelDir();
+  } catch {
+    kernelDir.value = "";
+  }
+}
+
+async function openKernelDir() {
+  if (!kernelDir.value) return;
+  try {
+    await revealItemInDir(kernelDir.value);
+  } catch (e) {
+    ElMessage.error(String(e));
+  }
+}
 
 function mb(bytes: number) {
   return (bytes / 1024 / 1024).toFixed(0);
@@ -273,9 +292,12 @@ onMounted(async () => {
   } catch {
     ElMessage.warning("读取配置失败，使用默认值");
   }
-  await runCheck();
+  // 环境探测要跑 java / sdkmanager 等子进程，放到首屏渲染之后，
+  // 否则整页 v-if="ready" 会白屏到检测结束。
   ready.value = true;
   resetScroll();
+  void runCheck();
+  void loadKernelDir();
 });
 
 onUnmounted(() => {
@@ -459,9 +481,18 @@ onUnmounted(() => {
             <el-button @click="importKernel">导入本地目录</el-button>
           </div>
           <span class="field-note">
-            来源为微软 WebView2 固定版本运行时（x64，约 300 MB），解压后约 680 MB 存到应用数据目录；也可以导入已解压、含
-            msedgewebview2.exe 的目录。
+            WebView2 完整离线运行时（x64）。下载包约两百兆，解压后几百兆，版本不同略有差别。
+            内核统一存放在下面的目录，也可以导入已解压的运行时目录。
           </span>
+          <div class="kernel-dir">
+            <span class="field-label">存放位置</span>
+            <span class="kernel-dir-path mono" :title="kernelDir">
+              {{ kernelDir || "读取中…" }}
+            </span>
+            <el-button size="small" :disabled="!kernelDir" @click="openKernelDir">
+              打开目录
+            </el-button>
+          </div>
           <el-progress
             v-if="kernelJob.running || kernelJob.percent > 0"
             class="install-progress"
@@ -777,6 +808,24 @@ h1 {
   display: flex;
   gap: 8px;
   margin-top: 16px;
+}
+
+/* 内核存放位置 */
+.kernel-dir {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.kernel-dir-path {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .kernel-list {

@@ -9,24 +9,31 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.Writer;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -56,6 +63,13 @@ public class LocalServer {
     private static final int HEAD_LIMIT = 64 * 1024;
     private static final int BUF_SIZE = 16 * 1024;
     private static final int SOCKET_TIMEOUT = 120000;
+    /**
+     * WS 隧道空闲上限（毫秒）：只有「两个方向都完全静默」超过该时长才判定为死连接。
+     * 单侧静音（长下载、只说不听）不算，见 {@link WsActivity}。
+     */
+    private static final int WS_IDLE_TIMEOUT = 300000;
+    /** 每条转发规则保留的空闲上游连接数（避免每个请求都重新 TLS 握手） */
+    private static final int MAX_IDLE_PER_RULE = 2;
     private static final byte[] CRLF = "\r\n".getBytes(StandardCharsets.ISO_8859_1);
 
     private final AssetManager assets;
@@ -68,6 +82,8 @@ public class LocalServer {
     /** 应用包名：端口未固定时用它派生稳定端口，保证 localStorage 不因端口变化而"丢失" */
     private final String appId;
     private final List<Rule> rules = new ArrayList<Rule>();
+    /** 调试包下的流量日志；正式包恒为 null，不产生文件 */
+    private final TrafficLog traffic;
 
     private ServerSocket serverSocket;
     private volatile boolean running;
@@ -94,6 +110,7 @@ public class LocalServer {
         }
         this.preferredPort = cfg.optInt("port", 0);
         this.appId = context.getPackageName();
+        this.traffic = TrafficLog.create(context, cfg.optBoolean("debugLog", false));
         this.basePath = normalizeBase(cfg.optString("basePath", "/"));
         JSONArray arr = cfg.optJSONArray("proxies");
         if (arr != null) {
@@ -214,6 +231,17 @@ public class LocalServer {
         running = false;
         closeQuietly(serverSocket);
         serverSocket = null;
+        if (traffic != null) {
+            traffic.close();
+        }
+        for (Rule rule : rules) {
+            synchronized (rule.idle) {
+                for (Upstream up : rule.idle) {
+                    up.close();
+                }
+                rule.idle.clear();
+            }
+        }
     }
 
     private void acceptLoop() {
@@ -253,6 +281,10 @@ public class LocalServer {
                 return;
             }
             Rule rule = matchRule(req.pathOnly());
+            if (traffic != null && "/__jianling-logs".equals(req.pathOnly())) {
+                serveTrafficLog(out, req);
+                return;
+            }
             if (rule != null && req.isUpgrade()) {
                 wsTunnel(socket, in, out, req, rule);
                 return;
@@ -274,6 +306,72 @@ public class LocalServer {
     }
 
     // ------------------------------------------------------------ 静态托管
+
+    /**
+     * 调试包专用：在 http://127.0.0.1:端口/__jianling-logs 直接查看流量日志，
+     * 加 ?file=文件名 查看单个文件内容。
+     */
+    private void serveTrafficLog(OutputStream out, Req req) throws IOException {
+        String file = null;
+        int queryAt = req.path.indexOf('?');
+        if (queryAt >= 0) {
+            for (String pair : req.path.substring(queryAt + 1).split("&")) {
+                if (pair.startsWith("file=")) {
+                    file = URLDecoder.decode(pair.substring(5), "UTF-8");
+                }
+            }
+        }
+        StringBuilder sb = new StringBuilder(4096);
+        if (file == null || file.length() == 0) {
+            sb.append("流量日志目录: ").append(traffic.dir.getAbsolutePath()).append("\r\n\r\n");
+            File[] files = traffic.dir.listFiles();
+            if (files != null) {
+                for (File f : files) {
+                    sb.append(f.getName()).append("  ").append(f.length()).append("B\r\n")
+                            .append("  http://127.0.0.1:").append(getPort())
+                            .append("/__jianling-logs?file=").append(f.getName()).append("\r\n");
+                }
+            }
+        } else {
+            File base = traffic.dir.getCanonicalFile();
+            File target = new File(base, file).getCanonicalFile();
+            if (!base.equals(target.getParentFile()) || !target.isFile()) {
+                plain(out, 404, "Not Found", "文件不存在");
+                return;
+            }
+            if (target.length() > 8L * 1024 * 1024) {
+                sb.append("文件过大（").append(target.length()).append("B），请用 adb pull 取回\r\n");
+            } else {
+                byte[] data = readFile(target);
+                if (file.endsWith(".log")) {
+                    sb.append(new String(data, StandardCharsets.UTF_8));
+                } else {
+                    sb.append("采样数据 ").append(data.length).append("B，前 512 字节：\r\n")
+                            .append(TrafficLog.hex(data, Math.min(512, data.length)));
+                }
+            }
+        }
+        byte[] body = sb.toString().getBytes(StandardCharsets.UTF_8);
+        out.write(("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: "
+                + body.length + "\r\nConnection: close\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
+        out.write(body);
+        out.flush();
+    }
+
+    private static byte[] readFile(File file) throws IOException {
+        InputStream in = new FileInputStream(file);
+        try {
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream((int) Math.min(file.length(), 1 << 20));
+            byte[] chunk = new byte[BUF_SIZE];
+            int read;
+            while ((read = in.read(chunk)) > 0) {
+                buffer.write(chunk, 0, read);
+            }
+            return buffer.toByteArray();
+        } finally {
+            closeQuietly(in);
+        }
+    }
 
     private void serveStatic(InputStream in, OutputStream out, Req req) throws IOException {
         if (!"GET".equals(req.method) && !"HEAD".equals(req.method)) {
@@ -324,7 +422,9 @@ public class LocalServer {
             StringBuilder head = new StringBuilder(256);
             head.append("HTTP/1.1 ").append(status).append(status == 206 ? " Partial Content" : " OK").append("\r\n");
             head.append("Content-Type: ").append(mime).append("\r\n");
-            head.append("Cache-Control: no-cache\r\n");
+            // 热推目录（files/www）随时会被「重新推送资源」整体替换，必须禁用缓存，
+            // 否则冷启动仍可能命中 WebView 磁盘缓存里的旧 JS/CSS。
+            head.append(fileRoot != null ? "Cache-Control: no-store\r\n" : "Cache-Control: no-cache\r\n");
             head.append("Connection: close\r\n");
             if (length >= 0) {
                 head.append("Accept-Ranges: bytes\r\n");
@@ -415,68 +515,248 @@ public class LocalServer {
     // ------------------------------------------------------------ 转发
 
     private void httpProxy(InputStream in, OutputStream out, Req req, Rule rule) throws IOException {
-        Socket upstream = null;
+        boolean hasBody = req.isChunked() || req.contentLength() > 0;
+        // 复用与重试都只对幂等方法生效：无 body 的 POST 一旦池中连接失效，重发会重复提交
+        boolean retryable = !hasBody && isIdempotent(req.method);
+        long startedAt = System.currentTimeMillis();
+        Upstream upstream = acquireUpstream(rule, retryable);
+        boolean responded = false;
         try {
-            upstream = openUpstream(rule);
-            OutputStream upOut = upstream.getOutputStream();
-            InputStream upIn = new BufferedInputStream(upstream.getInputStream(), BUF_SIZE);
-
-            upOut.write(buildHead(req, rule, false).getBytes(StandardCharsets.UTF_8));
-            upOut.flush();
-
-            if (req.expectsContinue()) {
-                out.write("HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
-                out.flush();
+            byte[] rawHead = sendRequest(in, out, req, rule, upstream, hasBody);
+            Resp resp = Resp.parse(rawHead);
+            if (resp == null) {
+                throw new IOException("上游响应无法解析");
             }
+            responded = true;
+            writeResponse(out, resp, upstream);
+            logHttp(req, rule, resp.status, System.currentTimeMillis() - startedAt, resp.contentLength);
+            if (canReuse(resp)) {
+                releaseUpstream(rule, upstream);
+            } else {
+                upstream.close();
+            }
+        } catch (IOException e) {
+            upstream.close();
+            if (responded || !upstream.reused || !retryable) {
+                if (!responded) {
+                    plain(out, 502, "Bad Gateway", "上游连接失败");
+                    logHttp(req, rule, 502, System.currentTimeMillis() - startedAt, -1);
+                }
+                throw e;
+            }
+            // 池里的连接已被服务端关闭：请求还没转发给客户端，可以安全重试一次
+            Log.i(TAG, "复用连接已失效，改用新连接重试: " + e.getMessage());
+            if (traffic != null) {
+                traffic.line("HTTP 复用连接失效，重试: " + TrafficLog.safePath(req.path)
+                        + " (" + e.getMessage() + ")");
+            }
+            Upstream fresh = new Upstream(openUpstream(rule));
+            try {
+                byte[] rawHead = sendRequest(in, out, req, rule, fresh, false);
+                Resp resp = Resp.parse(rawHead);
+                if (resp == null) {
+                    throw new IOException("上游响应无法解析");
+                }
+                writeResponse(out, resp, fresh);
+                logHttp(req, rule, resp.status, System.currentTimeMillis() - startedAt, resp.contentLength);
+            } catch (IOException retryError) {
+                fresh.close();
+                throw retryError;
+            }
+            fresh.close();
+        }
+    }
 
+    /** 把一条 HTTP 转发结果写进调试日志（仅调试包）。 */
+    private void logHttp(Req req, Rule rule, int status, long costMs, long bodySize) {
+        if (traffic == null) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder(160);
+        sb.append("HTTP ").append(req.method).append(' ')
+                .append(TrafficLog.safePath(req.path))
+                .append(" -> ").append(rule.host).append(':').append(rule.port)
+                .append(' ').append(status).append(' ').append(costMs).append("ms");
+        if (bodySize >= 0) {
+            sb.append(' ').append(bodySize).append("B");
+        }
+        String contentType = req.header("content-type");
+        if (contentType != null) {
+            sb.append(" req=").append(contentType);
+        }
+        traffic.line(sb.toString());
+    }
+
+    /** 发请求头 +（可能的）请求体，并读回响应头。 */
+    private byte[] sendRequest(InputStream in, OutputStream clientOut, Req req, Rule rule,
+                               Upstream upstream, boolean hasBody) throws IOException {
+        upstream.out.write(buildHead(req, rule, false).getBytes(StandardCharsets.UTF_8));
+        upstream.out.flush();
+
+        if (req.expectsContinue()) {
+            clientOut.write("HTTP/1.1 100 Continue\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+            clientOut.flush();
+        }
+        if (hasBody) {
             if (req.isChunked()) {
-                copyChunked(in, upOut);
+                copyChunked(in, upstream.out);
             } else {
                 long length = req.contentLength();
                 if (length > 0) {
-                    copyExact(in, upOut, length);
+                    copyExact(in, upstream.out, length);
                 }
             }
-            upOut.flush();
+            upstream.out.flush();
+        }
 
-            byte[] rawHead = readHead(upIn);
-            if (rawHead == null) {
-                plain(out, 502, "Bad Gateway", "上游没有响应");
-                return;
+        byte[] rawHead = readHead(upstream.in);
+        if (rawHead == null) {
+            throw new IOException("上游没有响应");
+        }
+        return rawHead;
+    }
+
+    /** 把上游响应回写给 WebView（响应侧统一 Connection: close，本地回环代价很低）。 */
+    private void writeResponse(OutputStream out, Resp resp, Upstream upstream) throws IOException {
+        StringBuilder head = new StringBuilder(512);
+        head.append("HTTP/1.1 ").append(resp.status).append(" X\r\n");
+        for (String[] header : resp.headers) {
+            String lower = header[0].toLowerCase(Locale.ROOT);
+            if ("connection".equals(lower) || "keep-alive".equals(lower) || "transfer-encoding".equals(lower)) {
+                continue;
             }
-            Resp resp = Resp.parse(rawHead);
-            if (resp == null) {
-                plain(out, 502, "Bad Gateway", "上游响应无法解析");
-                return;
-            }
-            StringBuilder head = new StringBuilder(512);
-            head.append("HTTP/1.1 ").append(resp.status).append(" X\r\n");
-            for (String[] header : resp.headers) {
-                String lower = header[0].toLowerCase(Locale.ROOT);
-                if ("connection".equals(lower) || "keep-alive".equals(lower) || "transfer-encoding".equals(lower)) {
-                    continue;
+            head.append(header[0]).append(": ").append(header[1]).append("\r\n");
+        }
+        if (resp.chunked) {
+            head.append("Transfer-Encoding: chunked\r\n");
+        }
+        head.append("Connection: close\r\n\r\n");
+        out.write(head.toString().getBytes(StandardCharsets.UTF_8));
+        out.flush();
+
+        if (!resp.hasBody()) {
+            return;
+        }
+        if (resp.chunked) {
+            copyChunked(upstream.in, out);
+        } else if (resp.contentLength >= 0) {
+            copyExact(upstream.in, out, resp.contentLength);
+        } else {
+            copyUntilEof(upstream.in, out);
+        }
+    }
+
+    /** 响应读完且服务端没有要求关闭时，连接可以放回池里复用。 */
+    private static boolean canReuse(Resp resp) {
+        if (resp == null || resp.status < 200 || resp.status == 101) {
+            return false;
+        }
+        if (!resp.http11) {
+            return false;
+        }
+        String connection = resp.header("connection");
+        if (connection != null && connection.toLowerCase(Locale.ROOT).contains("close")) {
+            return false;
+        }
+        if (resp.chunked || resp.contentLength >= 0) {
+            return true;
+        }
+        return !resp.hasBody();
+    }
+
+    /** 幂等方法才允许复用池中连接并在失效后重试一次。 */
+    private static boolean isIdempotent(String method) {
+        return "GET".equalsIgnoreCase(method)
+                || "HEAD".equalsIgnoreCase(method)
+                || "OPTIONS".equalsIgnoreCase(method);
+    }
+
+    /** WS 双向共享的最后收包时间：任一方向有数据都算连接活着。 */
+    private static final class WsActivity {
+        private volatile long lastReadAt = System.currentTimeMillis();
+
+        void touch() {
+            lastReadAt = System.currentTimeMillis();
+        }
+
+        long idleMs() {
+            return System.currentTimeMillis() - lastReadAt;
+        }
+    }
+
+    /** 上游连接：socket + 带缓冲的收发流，归还后可继续复用（缓冲一并保留）。 */
+    private static final class Upstream {
+        final Socket socket;
+        final InputStream in;
+        final OutputStream out;
+        /** 是否从空闲池取出（用于判断失败后能否重试） */
+        boolean reused;
+
+        Upstream(Socket socket) throws IOException {
+            this.socket = socket;
+            this.in = new BufferedInputStream(socket.getInputStream(), BUF_SIZE);
+            this.out = new BufferedOutputStream(socket.getOutputStream(), BUF_SIZE);
+        }
+
+        void close() {
+            closeQuietly(socket);
+        }
+    }
+
+    private Upstream acquireUpstream(Rule rule, boolean allowReuse) throws IOException {
+        if (allowReuse) {
+            synchronized (rule.idle) {
+                while (!rule.idle.isEmpty()) {
+                    Upstream candidate = rule.idle.remove(rule.idle.size() - 1);
+                    if (isUsable(candidate)) {
+                        candidate.reused = true;
+                        return candidate;
+                    }
+                    candidate.close();
                 }
-                head.append(header[0]).append(": ").append(header[1]).append("\r\n");
             }
-            if (resp.chunked) {
-                head.append("Transfer-Encoding: chunked\r\n");
-            }
-            head.append("Connection: close\r\n\r\n");
-            out.write(head.toString().getBytes(StandardCharsets.UTF_8));
-            out.flush();
+        }
+        return new Upstream(openUpstream(rule));
+    }
 
-            if (!resp.hasBody()) {
+    private void releaseUpstream(Rule rule, Upstream upstream) {
+        if (upstream == null) {
+            return;
+        }
+        synchronized (rule.idle) {
+            if (rule.idle.size() < MAX_IDLE_PER_RULE) {
+                upstream.reused = false;
+                rule.idle.add(upstream);
                 return;
             }
-            if (resp.chunked) {
-                copyChunked(upIn, out);
-            } else if (resp.contentLength >= 0) {
-                copyExact(upIn, out, resp.contentLength);
-            } else {
-                copyUntilEof(upIn, out);
+        }
+        upstream.close();
+    }
+
+    /** 池中连接是否还能用：已关闭 / 有残留字节都直接丢弃。 */
+    private static boolean isUsable(Upstream upstream) {
+        try {
+            Socket socket = upstream.socket;
+            if (socket.isClosed() || !socket.isConnected()
+                    || socket.isInputShutdown() || socket.isOutputShutdown()) {
+                return false;
             }
-        } finally {
-            closeQuietly(upstream);
+            if (upstream.in.available() > 0) {
+                return false;
+            }
+            int oldTimeout = socket.getSoTimeout();
+            try {
+                socket.setSoTimeout(1);
+                // 读到任何字节或 EOF 都说明连接状态不干净，直接丢弃
+                upstream.in.read();
+                return false;
+            } catch (SocketTimeoutException nothingPending) {
+                return true;
+            } finally {
+                socket.setSoTimeout(oldTimeout);
+            }
+        } catch (IOException e) {
+            return false;
         }
     }
 
@@ -500,25 +780,77 @@ public class LocalServer {
             out.flush();
             Resp resp = Resp.parse(rawHead);
             if (resp == null || resp.status != 101) {
+                if (traffic != null) {
+                    traffic.line("WS 握手失败 " + TrafficLog.safePath(req.path)
+                            + " -> " + rule.host + ":" + rule.port
+                            + " status=" + (resp == null ? -1 : resp.status));
+                }
                 return;
+            }
+            if (traffic != null) {
+                traffic.line("WS 握手成功 " + TrafficLog.safePath(req.path)
+                        + " -> " + rule.host + ":" + rule.port);
+                for (String[] header : req.headers) {
+                    String lower = header[0].toLowerCase(Locale.ROOT);
+                    if ("sec-websocket-protocol".equals(lower) || "origin".equals(lower)
+                            || "sec-websocket-extensions".equals(lower)) {
+                        traffic.line("  " + header[0] + ": "
+                                + TrafficLog.safeHeader(header[0], header[1]));
+                    }
+                }
+            }
+
+            // WS 是长连接，单侧静音很常见（长下载 / 只说不听），因此超时只作为
+            // 「双向完全静默」的死连接兜底；任一方向有字节都算连接还活着。
+            final WsActivity activity = new WsActivity();
+            try {
+                socket.setSoTimeout(WS_IDLE_TIMEOUT);
+                socket.setKeepAlive(true);
+                upstream.setSoTimeout(WS_IDLE_TIMEOUT);
+                upstream.setKeepAlive(true);
+            } catch (Exception ignored) {
+                // 部分设备不允许修改 keepalive，忽略
             }
 
             // 上行用独立线程搬运；TLS 流的读写可以分别在不同线程进行
             final OutputStream upOutRef = upOut;
+            final Socket upstreamRef = upstream;
+            final Socket clientRef = socket;
             Thread pump = new Thread(new Runnable() {
                 @Override
                 public void run() {
                     try {
-                        copyUntilEof(in, upOutRef);
-                    } catch (Exception ignored) {
+                        pumpWsFrames(in, upOutRef, true, activity);
+                    } catch (SocketTimeoutException e) {
+                        Log.w(TAG, "ws 上行空闲超时，回收隧道: " + e.getMessage());
+                        // 判定死连接：关掉两侧，让下行 read 立即退出
+                        closeQuietly(upstreamRef);
+                        closeQuietly(clientRef);
+                    } catch (Exception e) {
                         // 连接关闭属于正常结束
+                        Log.i(TAG, "ws 上行结束: " + e.getMessage());
+                    } finally {
+                        try {
+                            upOutRef.flush();
+                        } catch (IOException ignored) {
+                        }
+                        // 浏览器断开时把 FIN 传给上游，让服务端及时收尾
+                        try {
+                            upstreamRef.shutdownOutput();
+                        } catch (IOException ignored) {
+                        }
                     }
                 }
             }, "jianling-ws-up");
             pump.setDaemon(true);
             pump.start();
 
-            copyUntilEof(upIn, out);
+            pumpWsFrames(upIn, out, false, activity);
+        } catch (SocketTimeoutException e) {
+            Log.w(TAG, "ws 隧道空闲超时: " + e.getMessage());
+        } catch (IOException e) {
+            Log.w(TAG, "ws 隧道异常: " + e.getMessage());
+            throw e;
         } finally {
             closeQuietly(upstream);
             closeQuietly(socket);
@@ -536,6 +868,10 @@ public class LocalServer {
             String lower = header[0].toLowerCase(Locale.ROOT);
             if ("host".equals(lower) || "proxy-connection".equals(lower)
                     || "keep-alive".equals(lower) || "expect".equals(lower)) {
+                continue;
+            }
+            // 调试包去掉压缩协商：帧内容保持明文，日志/pcm 才能直接看出音频与 JSON
+            if (keepUpgrade && traffic != null && "sec-websocket-extensions".equals(lower)) {
                 continue;
             }
             if ("connection".equals(lower)) {
@@ -563,7 +899,7 @@ public class LocalServer {
             head.append(extra[0]).append(": ").append(extra[1]).append("\r\n");
         }
         if (!keepUpgrade) {
-            head.append("Connection: close\r\n");
+            head.append("Connection: keep-alive\r\n");
         }
         head.append("\r\n");
         return head.toString();
@@ -675,6 +1011,8 @@ public class LocalServer {
         String resolveIp = "";
         /** 追加到上游请求的 header（来自 rules 里的 headers JSON，解析失败则为空） */
         final List<String[]> extraHeaders = new ArrayList<String[]>();
+        /** 空闲上游连接池（访问时 synchronized (idle)） */
+        final List<Upstream> idle = new ArrayList<Upstream>();
     }
 
     private static Rule parseRule(JSONObject item) {
@@ -831,6 +1169,8 @@ public class LocalServer {
     private static final class Resp {
         int status;
         boolean chunked;
+        /** 状态行是否为 HTTP/1.1（连接复用的前提） */
+        boolean http11;
         long contentLength = -1;
         final List<String[]> headers = new ArrayList<String[]>();
 
@@ -848,6 +1188,7 @@ public class LocalServer {
                 return null;
             }
             Resp resp = new Resp();
+            resp.http11 = "HTTP/1.1".equalsIgnoreCase(first[0].trim());
             try {
                 resp.status = Integer.parseInt(first[1].trim());
             } catch (NumberFormatException e) {
@@ -880,6 +1221,15 @@ public class LocalServer {
 
         boolean hasBody() {
             return !(status < 200 || status == 204 || status == 304);
+        }
+
+        String header(String name) {
+            for (String[] header : headers) {
+                if (header[0].equalsIgnoreCase(name)) {
+                    return header[1];
+                }
+            }
+            return null;
         }
     }
 
@@ -954,6 +1304,148 @@ public class LocalServer {
         while ((read = in.read(buffer)) > 0) {
             out.write(buffer, 0, read);
             out.flush();
+        }
+    }
+
+    /**
+     * 原样转发 WebSocket 帧，同时把帧元数据（以及客户端上行音频）写进调试日志。
+     *
+     * <p>只解析帧头读长度，payload 逐字节透传（不解掩码、不解压缩），
+     * 因此对 permessage-deflate 等扩展仍然透明；只有调试包才真正写文件。
+     */
+    private void pumpWsFrames(InputStream in, OutputStream out, boolean uplink,
+                              WsActivity activity) throws IOException {
+        byte[] buffer = new byte[BUF_SIZE];
+        // 分片消息：首片带 opcode，续片为 0，这里记住整条消息的类型
+        int messageOpcode = -1;
+        // 文本消息常被分片，累积到整条消息结束再落日志
+        ByteArrayOutputStream pendingText = null;
+        boolean textAbandoned = false;
+        while (true) {
+            int b0;
+            try {
+                b0 = in.read();
+            } catch (SocketTimeoutException e) {
+                // 停在帧边界：另一方向仍有流量说明只是本侧静音，继续等新帧；
+                // 双向都静默超过上限才判定死连接（抛给上层回收隧道）。
+                if (activity.idleMs() >= WS_IDLE_TIMEOUT) {
+                    throw e;
+                }
+                continue;
+            }
+            if (b0 < 0) {
+                return;
+            }
+            activity.touch();
+            int b1 = in.read();
+            if (b1 < 0) {
+                throw new IOException("ws 帧头不完整");
+            }
+            activity.touch();
+            boolean fin = (b0 & 0x80) != 0;
+            int opcode = b0 & 0x0F;
+            if (opcode != 0) {
+                messageOpcode = opcode;
+                pendingText = null;
+                textAbandoned = false;
+            }
+            boolean audioFrame = messageOpcode == 2;
+            boolean masked = (b1 & 0x80) != 0;
+            long length = b1 & 0x7FL;
+
+            ByteArrayOutputStream frameHead = new ByteArrayOutputStream(14);
+            frameHead.write(b0);
+            frameHead.write(b1);
+            if (length == 126L) {
+                int hi = in.read();
+                int lo = in.read();
+                if (hi < 0 || lo < 0) {
+                    throw new IOException("ws 帧头不完整");
+                }
+                frameHead.write(hi);
+                frameHead.write(lo);
+                length = ((long) hi << 8) | (long) lo;
+            } else if (length == 127L) {
+                length = 0;
+                for (int i = 0; i < 8; i++) {
+                    int v = in.read();
+                    if (v < 0) {
+                        throw new IOException("ws 帧头不完整");
+                    }
+                    frameHead.write(v);
+                    length = (length << 8) | (long) v;
+                }
+            }
+            if (masked) {
+                for (int i = 0; i < 4; i++) {
+                    int v = in.read();
+                    if (v < 0) {
+                        throw new IOException("ws 帧头不完整");
+                    }
+                    frameHead.write(v);
+                }
+            }
+            out.write(frameHead.toByteArray());
+            out.flush();
+
+            // 超过 64MB 的帧只透传、不记录，避免把内存/日志撑爆
+            TrafficLog log = traffic;
+            if (log != null) {
+                log.line("WS " + (uplink ? "C>S" : "S>C")
+                        + " op=" + opcode + " fin=" + (fin ? 1 : 0)
+                        + " len=" + length + (masked ? " masked" : ""));
+            }
+            boolean recordPayload = log != null && length <= 64L * 1024 * 1024;
+            if (recordPayload && messageOpcode == 1 && !textAbandoned) {
+                if (pendingText == null) {
+                    pendingText = new ByteArrayOutputStream();
+                }
+                if (pendingText.size() + length > 131072L) {
+                    // 单条文本消息超过 128KB 就放弃记录内容，避免日志膨胀
+                    pendingText = null;
+                    textAbandoned = true;
+                }
+            }
+            byte[] firstBytes = recordPayload && audioFrame && opcode != 0
+                    ? new byte[(int) Math.min(16L, length)] : null;
+            int firstFilled = 0;
+            long remaining = length;
+            while (remaining > 0) {
+                int want = (int) Math.min((long) buffer.length, remaining);
+                int got = in.read(buffer, 0, want);
+                if (got < 0) {
+                    throw new IOException("ws 帧负载不完整");
+                }
+                activity.touch();
+                if (firstBytes != null && firstFilled < firstBytes.length) {
+                    int copy = Math.min(got, firstBytes.length - firstFilled);
+                    System.arraycopy(buffer, 0, firstBytes, firstFilled, copy);
+                    firstFilled += copy;
+                }
+                if (pendingText != null) {
+                    pendingText.write(buffer, 0, got);
+                }
+                out.write(buffer, 0, got);
+                // 音频原始字节按方向留档，便于离线分析录音与播放两侧
+                if (recordPayload && audioFrame) {
+                    log.audio(uplink, buffer, 0, got);
+                }
+                remaining -= got;
+            }
+            out.flush();
+            if (log != null) {
+                if (firstBytes != null && firstFilled > 0) {
+                    log.line("  head=" + TrafficLog.hex(firstBytes, firstFilled));
+                }
+                if (fin) {
+                    if (pendingText != null) {
+                        log.line("  text=" + TrafficLog.escape(pendingText.toString("UTF-8")));
+                        pendingText = null;
+                    } else if (textAbandoned) {
+                        log.line("  text=<skipped 超出记录上限>");
+                    }
+                }
+            }
         }
     }
 
@@ -1198,6 +1690,209 @@ public class LocalServer {
             target.close();
         } catch (IOException ignored) {
             // 忽略
+        }
+    }
+
+    // ------------------------------------------------------------ 调试流量日志
+
+    /**
+     * 只在构建时勾选了「调试流量日志」的调试包里，把转发流量落到应用外部私有目录，
+     * 方便 adb pull 后离线排查：
+     *
+     * <pre>
+     * /sdcard/Android/data/&lt;包名&gt;/files/jianling-logs/traffic-yyyyMMdd-HHmmss-SSS.log
+     * /sdcard/Android/data/&lt;包名&gt;/files/jianling-logs/traffic-yyyyMMdd-HHmmss-SSS.uplink.pcm
+     * </pre>
+     *
+     * 正式包恒不创建任何文件；写日志失败也绝不影响转发。
+     */
+    private static final class TrafficLog {
+        /** 音频留档上限（每个方向），超过后停止写入 */
+        private static final long PCM_LIMIT = 200L * 1024 * 1024;
+        private final File dir;
+        private final File logFile;
+        private final File uplinkFile;
+        private final File downlinkFile;
+        private final SimpleDateFormat timeFormat = new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
+        private Writer writer;
+        private FileOutputStream uplinkOut;
+        private FileOutputStream downlinkOut;
+        private long uplinkBytes;
+        private long downlinkBytes;
+
+        private TrafficLog(File dir, File logFile, File uplinkFile, File downlinkFile) {
+            this.dir = dir;
+            this.logFile = logFile;
+            this.uplinkFile = uplinkFile;
+            this.downlinkFile = downlinkFile;
+        }
+
+        static TrafficLog create(Context context, boolean debugLog) {
+            // 只认构建时写入的 debugLog 开关（正式包恒为 false），不按 debuggable 隐式开启
+            if (!debugLog) {
+                return null;
+            }
+            try {
+                File base = context.getExternalFilesDir(null);
+                if (base == null) {
+                    base = context.getFilesDir();
+                }
+                File dir = new File(base, "jianling-logs");
+                if (!dir.isDirectory() && !dir.mkdirs()) {
+                    Log.w(TAG, "流量日志目录创建失败: " + dir.getAbsolutePath());
+                    return null;
+                }
+                String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(new Date());
+                TrafficLog log = new TrafficLog(dir, new File(dir, "traffic-" + stamp + ".log"),
+                        new File(dir, "traffic-" + stamp + ".uplink.pcm"),
+                        new File(dir, "traffic-" + stamp + ".downlink.pcm"));
+                log.writer = new OutputStreamWriter(new FileOutputStream(log.logFile, true), "UTF-8");
+                log.line("会话开始 " + log.logFile.getAbsolutePath());
+                Log.i(TAG, "流量日志: " + log.logFile.getAbsolutePath());
+                return log;
+            } catch (Exception e) {
+                Log.w(TAG, "流量日志初始化失败: " + e.getMessage());
+                return null;
+            }
+        }
+
+        synchronized void line(String text) {
+            if (writer == null) {
+                return;
+            }
+            try {
+                writer.write(timeFormat.format(new Date()));
+                writer.write(' ');
+                writer.write(text);
+                writer.write("\r\n");
+                writer.flush();
+            } catch (IOException e) {
+                closeQuietly(writer);
+                writer = null;
+            }
+        }
+
+        /** 按方向把音频原始字节追加到 .uplink.pcm / .downlink.pcm */
+        synchronized void audio(boolean uplink, byte[] data, int offset, int length) {
+            if (length <= 0) {
+                return;
+            }
+            try {
+                if (uplink) {
+                    if (uplinkBytes >= PCM_LIMIT) {
+                        return;
+                    }
+                    if (uplinkOut == null) {
+                        uplinkOut = new FileOutputStream(uplinkFile, true);
+                    }
+                    uplinkOut.write(data, offset, length);
+                    uplinkBytes += length;
+                } else {
+                    if (downlinkBytes >= PCM_LIMIT) {
+                        return;
+                    }
+                    if (downlinkOut == null) {
+                        downlinkOut = new FileOutputStream(downlinkFile, true);
+                    }
+                    downlinkOut.write(data, offset, length);
+                    downlinkBytes += length;
+                }
+            } catch (IOException e) {
+                if (uplink) {
+                    uplinkBytes = PCM_LIMIT;
+                    closeQuietly(uplinkOut);
+                    uplinkOut = null;
+                } else {
+                    downlinkBytes = PCM_LIMIT;
+                    closeQuietly(downlinkOut);
+                    downlinkOut = null;
+                }
+            }
+        }
+
+        synchronized void close() {
+            if (writer != null) {
+                try {
+                    writer.flush();
+                } catch (IOException ignored) {
+                    // 忽略
+                }
+                closeQuietly(writer);
+                writer = null;
+            }
+            closeQuietly(uplinkOut);
+            uplinkOut = null;
+            closeQuietly(downlinkOut);
+            downlinkOut = null;
+        }
+
+        /** 头部字段脱敏：凭证类只保留前缀/长度 */
+        static String safeHeader(String name, String value) {
+            if (value == null) {
+                return "";
+            }
+            String lower = name.toLowerCase(Locale.ROOT);
+            if (lower.contains("protocol")) {
+                // 如 auth-token.<jwt>：只留协议名，token 部分丢掉
+                int dot = value.indexOf('.');
+                return dot > 0 ? value.substring(0, dot) + ".<hidden>" : "<hidden len=" + value.length() + ">";
+            }
+            if (lower.contains("authorization") || lower.contains("cookie")
+                    || lower.contains("token") || lower.contains("key")
+                    || lower.contains("secret")) {
+                return "<hidden len=" + value.length() + ">";
+            }
+            return value;
+        }
+
+        /** URL 里的 token/ticket 等参数脱敏 */
+        static String safePath(String path) {
+            if (path == null) {
+                return "/";
+            }
+            int queryAt = path.indexOf('?');
+            if (queryAt < 0) {
+                return path;
+            }
+            StringBuilder sb = new StringBuilder(path.substring(0, queryAt + 1));
+            String[] parts = path.substring(queryAt + 1).split("&");
+            for (int i = 0; i < parts.length; i++) {
+                if (i > 0) {
+                    sb.append('&');
+                }
+                String part = parts[i];
+                int eq = part.indexOf('=');
+                String key = (eq >= 0 ? part.substring(0, eq) : part).toLowerCase(Locale.ROOT);
+                if (key.contains("token") || key.contains("ticket")
+                        || key.contains("key") || key.contains("secret")) {
+                    sb.append(part, 0, eq >= 0 ? eq : part.length()).append("=***");
+                } else {
+                    sb.append(part);
+                }
+            }
+            return sb.toString();
+        }
+
+        static String hex(byte[] data, int length) {
+            StringBuilder sb = new StringBuilder(length * 3);
+            for (int i = 0; i < length && i < data.length; i++) {
+                if (sb.length() > 0) {
+                    sb.append(' ');
+                }
+                int v = data[i] & 0xFF;
+                if (v < 16) {
+                    sb.append('0');
+                }
+                sb.append(Integer.toHexString(v));
+            }
+            return sb.toString();
+        }
+
+        static String escape(String text) {
+            if (text == null) {
+                return "";
+            }
+            return text.replace("\r", "\\r").replace("\n", "\\n");
         }
     }
 }

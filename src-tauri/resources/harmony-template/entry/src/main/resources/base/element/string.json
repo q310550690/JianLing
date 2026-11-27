@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "JianLing 套壳"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "套壳入口"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "__APP_NAME__"
+    }
+  ]
+}

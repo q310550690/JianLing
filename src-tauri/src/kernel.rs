@@ -303,6 +303,13 @@ pub fn delete_windows_kernel(app: AppHandle, id: String, path: String) -> Result
     Ok(())
 }
 
+/// 内核存放目录：下载与导入的运行时都落在 `<本地数据目录>/kernels/<版本>`，
+/// 设置页用它展示实际落点并提供「打开目录」。
+#[tauri::command]
+pub fn windows_kernel_dir(app: AppHandle) -> Result<String, String> {
+    Ok(kernels_root(&app)?.to_string_lossy().to_string())
+}
+
 fn sanitize(value: &str) -> String {
     let cleaned: String = value
         .chars()
